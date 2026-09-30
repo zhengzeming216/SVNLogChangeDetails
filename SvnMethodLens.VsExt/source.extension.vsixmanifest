@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011">
+  <Metadata>
+    <Identity Id="SvnMethodLens.9f1c2b3a-4d5e-4f6a-8b1c-2d3e4f5a6b7c" Version="1.0.0" Language="zh-CN" Publisher="SvnMethodLens" />
+    <DisplayName>Svn Method Lens</DisplayName>
+    <Description xml:space="preserve">在 C# 方法名上方显示 SVN 行级归属（最后修改人 / 改动次数 / 最后修订），类似 Git 的 CodeLens。无需 Git，直接读取 SVN 工作副本的 blame 数据。需要 TortoiseSVN 的 svn.exe。</Description>
+    <Icon>logo.png</Icon>
+    <PreviewImage>preview.png</PreviewImage>
+    <Tags>svn;subversion;codelens;blame;method</Tags>
+  </Metadata>
+  <Installation InstalledByMsi="false" AllUsers="false">
+    <InstallationTarget Id="Microsoft.VisualStudio.Pro" Version="[17.0,19.0)">
+      <ProductArchitecture>amd64</ProductArchitecture>
+    </InstallationTarget>
+    <InstallationTarget Id="Microsoft.VisualStudio.Community" Version="[17.0,19.0)">
+      <ProductArchitecture>amd64</ProductArchitecture>
+    </InstallationTarget>
+    <InstallationTarget Id="Microsoft.VisualStudio.Enterprise" Version="[17.0,19.0)">
+      <ProductArchitecture>amd64</ProductArchitecture>
+    </InstallationTarget>
+  </Installation>
+  <Assets>
+    <Asset Type="Microsoft.VisualStudio.VsPackage" Path="SvnMethodLens.pkgdef" />
+    <Asset Type="Microsoft.VisualStudio.MefComponent" Path="SvnMethodLens.dll" />
+  </Assets>
+  <Dependencies>
+    <Dependency Id="Microsoft.Framework.NDP" DisplayName="Microsoft .NET Framework" Version="[4.7.2,)" />
+  </Dependencies>
+  <Prerequisites>
+    <Prerequisite Id="Microsoft.VisualStudio.Component.CoreEditor" Version="[17.0,)" DisplayName="Visual Studio core editor" />
+  </Prerequisites>
+</PackageManifest>
