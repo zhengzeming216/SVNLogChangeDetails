@@ -84,15 +84,29 @@ namespace SvnMethodLens.Editor
     internal sealed class LensLineTransformSourceProvider : ILineTransformSourceProvider
     {
         public ILineTransformSource Create(IWpfTextView textView)
-            => new LensLineTransformSource(LensState.GetOrCreate(textView));
+            => new LensLineTransformSource(LensState.GetOrCreate(textView), textView);
     }
 
     internal sealed class LensLineTransformSource : ILineTransformSource
     {
-        private const double TopSpace = 17.0;
         private readonly LensState _state;
+        private readonly IWpfTextView _view;
 
-        public LensLineTransformSource(LensState state) => _state = state;
+        public LensLineTransformSource(LensState state, IWpfTextView view)
+        {
+            _state = state;
+            _view = view;
+        }
+
+        // 我们标注自身需要的高度
+        private const double LabelBand = 17.0;
+
+        // 让位给 VS 自带"N 个引用"（CodeLens）的高度：它的行变换与我们的是
+        // Max 合并而非相加，且它贴着文字上沿绘制（TextTop - 高度），
+        // 所以必须把空带加高，才能两行并存（引用在下、Svn 标注在上）。
+        private double CodeLensAllowance => Math.Max(12.0, _view.LineHeight * 0.8);
+
+        private double TotalTopSpace => LabelBand + CodeLensAllowance;
 
         public LineTransform GetLineTransform(ITextViewLine line, double suggestedTopChange, ViewRelativePosition affinity)
         {
@@ -100,13 +114,13 @@ namespace SvnMethodLens.Editor
             {
                 int line0 = line.Start.GetContainingLine().LineNumber;
                 if (_state.IsMethodStart(line0))
-                    return new LineTransform(1.0, TopSpace, 0.0);
+                    return new LineTransform(TotalTopSpace, 0.0, 1.0);
             }
             catch
             {
                 // 行未就绪等极端情况：返回恒等变换
             }
-            return new LineTransform(1.0, 0.0, 0.0);
+            return new LineTransform(0.0, 0.0, 1.0);
         }
     }
 
