@@ -1,4 +1,4 @@
-# Svn Method Lens
+# SVNLogChangeDetails
 
 在 Visual Studio 2022 / 2026 的 C# 编辑器里，把 **SVN 的方法级归属**直接显示在每个方法名上方 —— 体验对齐 Git 的 CodeLens。
 
@@ -33,7 +33,7 @@ public async Task<ResultList<ShipViewModel>> GetShipList(...)
 
 ## 安装
 
-双击 `dist/SvnMethodLens.vsix`，选择目标 VS 实例安装，装完重启 VS。
+到 [Releases](https://github.com/zhengzeming216/SVNLogChangeDetails/releases) 下载最新 vsix 安装，装完重启 VS。
 
 > 若非管理员安装后扩展不可见（VSIXInstaller 已知问题：会把 `extensionDir` 写成 Program Files 悬空路径），运行 `install.ps1` 一键修复重装。
 
@@ -65,4 +65,4 @@ ScanTest/              扫描器回归工具（与 Roslyn 结果对照）
 缓存：`%LOCALAPPDATA%\SvnMethodLens\cache\*.blame`，删除即强制重算。
 
 ---
-作者：Marvin（zhengzeming216）
+作者：Marvin（zhengzeming216） · 基于 [MIT License](LICENSE.txt) 开源
