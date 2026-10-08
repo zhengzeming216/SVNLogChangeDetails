@@ -208,8 +208,9 @@ namespace SvnMethodLens.Editor
             return Task.FromResult(list);
         }
 
-        /// <summary>文件级完整提交历史（供「Show all file changes」历史窗口），带缓存。</summary>
-        public async Task<List<CommitInfo>> GetFileLogAsync(string filePath, int max = 200)
+        /// <summary>文件级完整提交历史（供「Show all file changes」历史窗口），带缓存。
+        /// max&lt;=0 表示不限制条数（拉全量，与 TortoiseSVN 的 log 一致）。</summary>
+        public async Task<List<CommitInfo>> GetFileLogAsync(string filePath, int max = 0)
         {
             var key = "file|" + filePath;
             if (_fileLogCache.TryGetValue(key, out var hit)) return hit;
@@ -232,7 +233,9 @@ namespace SvnMethodLens.Editor
             {
                 var root = GetWcRoot(filePath);
                 var rel = ToRelative(root, filePath);
-                return ParseLogXml(RunSvn(root, $"log --xml --non-interactive --limit {max} -- \"{rel}\""));
+                // max<=0：不加 --limit，拉取该文件的完整提交历史（之前默认 200 条只到最近几个月）
+                var limitArg = max > 0 ? $" --limit {max}" : "";
+                return ParseLogXml(RunSvn(root, $"log --xml --non-interactive{limitArg} -- \"{rel}\""));
             }
             catch (Exception ex)
             {
