@@ -42,6 +42,20 @@ namespace SvnMethodLens.Editor
         public string Message = "";
     }
 
+    /// <summary>提交明细中的一条变更路径（svn log -v 的 path 条目）。</summary>
+    public sealed class ChangedPath
+    {
+        public string Action = "";
+        public string Path = "";
+    }
+
+    /// <summary>单次提交的明细（含变更文件列表），供「View Commit Details」。</summary>
+    public sealed class CommitDetail
+    {
+        public CommitInfo Commit = new CommitInfo();
+        public List<ChangedPath> Paths = new List<ChangedPath>();
+    }
+
     /// <summary>
     /// 装饰层的数据源：解析工作副本根、跑 svn blame、用轻量扫描器切方法、聚合成每方法归属。
     /// 大文件的 svn blame 可能非常慢（几十秒，取决于文件行数 × 修订数），因此：
@@ -60,6 +74,8 @@ namespace SvnMethodLens.Editor
         private readonly ConcurrentDictionary<string, Task<List<MethodBlameView>>> _inflight = new();
         private readonly ConcurrentDictionary<string, List<CommitInfo>> _logCache = new();
         private readonly ConcurrentDictionary<string, Task<List<CommitInfo>>> _logInflight = new();
+        private readonly ConcurrentDictionary<string, List<CommitInfo>> _fileLogCache = new();
+        private readonly ConcurrentDictionary<string, Task<List<CommitInfo>>> _fileLogInflight = new();
 
         public BlameService()
         {
@@ -183,32 +199,106 @@ namespace SvnMethodLens.Editor
                 var args = "log --xml --non-interactive -c " +
                            string.Join(",", revs.Select(r => r.ToString()).ToArray()) +
                            " -- \"" + rel + "\"";
-                var xml = RunSvn(root, args);
-                var doc = System.Xml.Linq.XDocument.Parse(xml);
-                foreach (var e in doc.Descendants("logentry"))
-                {
-                    int rev = 0;
-                    var revAttr = e.Attribute("revision");
-                    if (revAttr != null) int.TryParse(revAttr.Value, out rev);
-                    var authorEl = e.Element("author");
-                    var dateEl = e.Element("date");
-                    var msgEl = e.Element("msg");
-                    var date = DateTime.MinValue;
-                    if (dateEl != null) DateTime.TryParse(dateEl.Value, out date);
-                    list.Add(new CommitInfo
-                    {
-                        Revision = rev,
-                        Author = authorEl != null ? authorEl.Value : "",
-                        Date = date,
-                        Message = msgEl != null ? (msgEl.Value ?? "") : ""
-                    });
-                }
+                list = ParseLogXml(RunSvn(root, args));
             }
             catch (Exception ex)
             {
                 Log($"svn log failed: {ex.Message}");
             }
             return Task.FromResult(list);
+        }
+
+        /// <summary>文件级完整提交历史（供「Show all file changes」历史窗口），带缓存。</summary>
+        public async Task<List<CommitInfo>> GetFileLogAsync(string filePath, int max = 200)
+        {
+            var key = "file|" + filePath;
+            if (_fileLogCache.TryGetValue(key, out var hit)) return hit;
+            var task = _fileLogInflight.GetOrAdd(key, _ => Task.Run(() => LoadFileLogAsync(filePath, max)));
+            try
+            {
+                var r = await task.ConfigureAwait(false);
+                _fileLogCache[key] = r;
+                return r;
+            }
+            finally
+            {
+                _fileLogInflight.TryRemove(key, out _);
+            }
+        }
+
+        private List<CommitInfo> LoadFileLogAsync(string filePath, int max)
+        {
+            try
+            {
+                var root = GetWcRoot(filePath);
+                var rel = ToRelative(root, filePath);
+                return ParseLogXml(RunSvn(root, $"log --xml --non-interactive --limit {max} -- \"{rel}\""));
+            }
+            catch (Exception ex)
+            {
+                Log($"svn file log failed: {ex.Message}");
+                return new List<CommitInfo>();
+            }
+        }
+
+        /// <summary>单次提交的变更文件明细（svn log -v），供「View Commit Details」。</summary>
+        public async Task<CommitDetail> GetCommitDetailAsync(string filePath, int revision)
+        {
+            return await Task.Run(() =>
+            {
+                var d = new CommitDetail();
+                try
+                {
+                    var root = GetWcRoot(filePath);
+                    var rel = ToRelative(root, filePath);
+                    var xml = RunSvn(root, $"log --xml --non-interactive -v -r {revision} -- \"{rel}\"");
+                    var doc = System.Xml.Linq.XDocument.Parse(xml);
+                    var e = doc.Descendants("logentry").FirstOrDefault();
+                    if (e != null)
+                    {
+                        d.Commit = ParseOne(e);
+                        foreach (var p in e.Descendants("path"))
+                            d.Paths.Add(new ChangedPath
+                            {
+                                Action = (string)p.Attribute("action") ?? "",
+                                Path = p.Value
+                            });
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"svn log -v failed: {ex.Message}");
+                }
+                return d;
+            }).ConfigureAwait(false);
+        }
+
+        private static List<CommitInfo> ParseLogXml(string xml)
+        {
+            var list = new List<CommitInfo>();
+            var doc = System.Xml.Linq.XDocument.Parse(xml);
+            foreach (var e in doc.Descendants("logentry"))
+                list.Add(ParseOne(e));
+            return list;
+        }
+
+        private static CommitInfo ParseOne(System.Xml.Linq.XElement e)
+        {
+            int rev = 0;
+            var revAttr = e.Attribute("revision");
+            if (revAttr != null) int.TryParse(revAttr.Value, out rev);
+            var authorEl = e.Element("author");
+            var dateEl = e.Element("date");
+            var msgEl = e.Element("msg");
+            var date = DateTime.MinValue;
+            if (dateEl != null) DateTime.TryParse(dateEl.Value, out date);
+            return new CommitInfo
+            {
+                Revision = rev,
+                Author = authorEl != null ? authorEl.Value : "",
+                Date = date,
+                Message = msgEl != null ? (msgEl.Value ?? "") : ""
+            };
         }
 
         private string RunSvn(string workingDir, string args)

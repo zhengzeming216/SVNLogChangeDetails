@@ -1,11 +1,14 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel.Composition;
+using System.Diagnostics;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using System.Windows.Input;
 using System.Windows.Media;
 using Microsoft.VisualStudio.Text;
 using Microsoft.VisualStudio.Text.Editor;
@@ -146,6 +149,10 @@ namespace SvnMethodLens.Editor
         // 点击瞬间捕获的标签屏幕坐标；Popup 据此固定在稳定锚点上，不再随装饰重绘而漂走
         private Point _popupAnchorScreen = new Point(double.NaN, double.NaN);
 
+        // Git CodeLens 式悬停交互：段上悬停 450ms 打开弹框；鼠标离开标签/弹框 250ms 后关闭
+        private System.Windows.Threading.DispatcherTimer _hoverTimer;
+        private System.Windows.Threading.DispatcherTimer _closeTimer;
+
         public MethodAdornmentManager(IWpfTextView view, BlameService blame)
         {
             _view = view;
@@ -160,6 +167,8 @@ namespace SvnMethodLens.Editor
 
             _view.LayoutChanged += OnLayoutChanged;
             _view.Closed += OnClosed;
+            // 在编辑器任意处按下鼠标时关闭弹框（Git CodeLens 行为）
+            _view.VisualElement.PreviewMouseDown += (s, e) => ClosePopup();
 
             ScheduleRefresh();
         }
@@ -172,7 +181,11 @@ namespace SvnMethodLens.Editor
             // 滚动时关闭详情弹框，避免它飘在已经滚走的代码上（这也是"飘走"的一种表现）
             if (_popup.IsOpen && !double.IsNaN(_lastViewportTop) &&
                 Math.Abs(_view.ViewportTop - _lastViewportTop) > 0.5)
+            {
                 _popup.IsOpen = false;
+                CancelHover();
+                CancelCloseTimer();
+            }
             _lastViewportTop = _view.ViewportTop;
             RedrawVisible();
         }
@@ -184,6 +197,8 @@ namespace SvnMethodLens.Editor
             _view.LayoutChanged -= OnLayoutChanged;
             _view.Closed -= OnClosed;
             try { _popup.IsOpen = false; _popup.Child = null; } catch { }
+            CancelHover();
+            CancelCloseTimer();
             lock (_gate) _disposed = true;
         }
 
@@ -396,14 +411,36 @@ namespace SvnMethodLens.Editor
 
         private UIElement CreateLabel(MethodBlameView m)
         {
+            // Git CodeLens 结构：两段式标签，各自可悬停
+            //   段1「Baker, 42 days ago」→ 提交表格弹框；段2「2 authors, 2 changes」→ Team Activity 图表
+            var panel = new StackPanel { Orientation = Orientation.Horizontal };
+
+            var sep = new TextBlock { Text = " | ", FontSize = 11 };
+            try
+            {
+                sep.SetResourceReference(TextBlock.ForegroundProperty,
+                    Microsoft.VisualStudio.Shell.VsBrushes.GrayTextKey);
+            }
+            catch
+            {
+                sep.Foreground = new SolidColorBrush(Color.FromRgb(128, 128, 128));
+            }
+
+            panel.Children.Add(MakeSegment(m, false, FormatHead(m)));
+            panel.Children.Add(sep);
+            panel.Children.Add(MakeSegment(m, true, FormatTail(m)));
+            return panel;
+        }
+
+        private TextBlock MakeSegment(MethodBlameView m, bool activity, string text)
+        {
             var tb = new TextBlock
             {
                 FontSize = 11,
                 TextWrapping = TextWrapping.NoWrap,
-                Cursor = System.Windows.Input.Cursors.Hand,
-                Text = Format(m)
+                Cursor = Cursors.Hand,
+                Text = text
             };
-            // 与 VS 自带"N 个引用"（CodeLens）同款灰色，且跟随深/浅色主题
             try
             {
                 tb.SetResourceReference(TextBlock.ForegroundProperty,
@@ -413,32 +450,88 @@ namespace SvnMethodLens.Editor
             {
                 tb.Foreground = new SolidColorBrush(Color.FromRgb(128, 128, 128));
             }
-            tb.MouseLeftButtonUp += (s, e) => { ShowPopup(m, tb); e.Handled = true; };
+            tb.MouseEnter += (s, e) => BeginHover(m, tb, activity);
+            tb.MouseLeave += (s, e) => ScheduleClose();
+            tb.MouseLeftButtonUp += (s, e) => { CancelHover(); OpenPopup(m, tb, activity); e.Handled = true; };
             return tb;
         }
 
-        /// <summary>Git CodeLens 风格文案：作者，多久之前 · N 名作者，M 次更改。</summary>
-        private static string Format(MethodBlameView m)
-        {
-            if (m.HasLocal)
-                return $"本地未提交改动 · 主作者 {m.PrimaryAuthor} · {m.AuthorCount} 名作者";
+        #region 悬停计时
 
-            var when = m.LastDate.HasValue ? TimeAgo(m.LastDate.Value) : "";
-            var head = string.IsNullOrEmpty(when) ? m.LastAuthor : $"{m.LastAuthor}，{when}";
-            return $"{head} · {m.AuthorCount} 名作者，{m.ChangeCount} 次更改（r{m.LastRevision}）";
+        private void BeginHover(MethodBlameView m, FrameworkElement anchor, bool activity)
+        {
+            CancelCloseTimer();
+            CancelHover();
+            var t = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(450) };
+            _hoverTimer = t;
+            t.Tick += (s, e) =>
+            {
+                t.Stop();
+                if (_hoverTimer == t) _hoverTimer = null;
+                OpenPopup(m, anchor, activity);
+            };
+            t.Start();
         }
+
+        private void CancelHover()
+        {
+            if (_hoverTimer != null) { _hoverTimer.Stop(); _hoverTimer = null; }
+        }
+
+        private void ScheduleClose()
+        {
+            CancelHover();
+            if (!_popup.IsOpen) return;
+            CancelCloseTimer();
+            var t = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
+            _closeTimer = t;
+            t.Tick += (s, e) =>
+            {
+                t.Stop();
+                if (_closeTimer == t) _closeTimer = null;
+                _popup.IsOpen = false;
+            };
+            t.Start();
+        }
+
+        private void CancelCloseTimer()
+        {
+            if (_closeTimer != null) { _closeTimer.Stop(); _closeTimer = null; }
+        }
+
+        #endregion
+
+        /// <summary>Git CodeLens 风格文案（段1：作者, 多久之前）。</summary>
+        private static string FormatHead(MethodBlameView m)
+        {
+            if (m.HasLocal) return "Not committed yet";
+            if (string.IsNullOrEmpty(m.LastAuthor)) return "";
+            var when = m.LastDate.HasValue ? TimeAgo(m.LastDate.Value) : "";
+            return string.IsNullOrEmpty(when) ? m.LastAuthor : $"{m.LastAuthor}, {when}";
+        }
+
+        /// <summary>Git CodeLens 风格文案（段2：N 名作者, M 次更改）。</summary>
+        private static string FormatTail(MethodBlameView m)
+            => $"{m.AuthorCount} {Pl(m.AuthorCount, "author", "authors")}, " +
+               $"{m.ChangeCount} {Pl(m.ChangeCount, "change", "changes")}";
+
+        private static string Pl(int n, string one, string many) => n == 1 ? one : many;
 
         private static string TimeAgo(DateTime utc)
         {
             try
             {
                 var span = DateTime.UtcNow - (utc.Kind == DateTimeKind.Utc ? utc : utc.ToUniversalTime());
-                if (span.TotalMinutes < 1) return "刚刚";
-                if (span.TotalHours < 1) return $"{(int)span.TotalMinutes} 分钟前";
-                if (span.TotalDays < 1) return $"{(int)span.TotalHours} 小时前";
-                if (span.TotalDays < 30) return $"{(int)span.TotalDays} 天前";
-                if (span.TotalDays < 365) return $"{(int)(span.TotalDays / 30)} 个月前";
-                return $"{(int)(span.TotalDays / 365)} 年前";
+                if (span.TotalMinutes < 1) return "just now";
+                if (span.TotalHours < 1)
+                    return Pl((int)span.TotalMinutes, "1 minute ago", $"{(int)span.TotalMinutes} minutes ago");
+                if (span.TotalDays < 1)
+                    return Pl((int)span.TotalHours, "1 hour ago", $"{(int)span.TotalHours} hours ago");
+                if (span.TotalDays < 30)
+                    return Pl((int)span.TotalDays, "1 day ago", $"{(int)span.TotalDays} days ago");
+                if (span.TotalDays < 365)
+                    return Pl((int)(span.TotalDays / 30), "1 month ago", $"{(int)(span.TotalDays / 30)} months ago");
+                return Pl((int)(span.TotalDays / 365), "1 year ago", $"{(int)(span.TotalDays / 365)} years ago");
             }
             catch
             {
@@ -446,46 +539,31 @@ namespace SvnMethodLens.Editor
             }
         }
 
-        /// <summary>点击标注显示该方法的提交历史（按需 svn log，带缓存）。</summary>
-        private void ShowPopup(MethodBlameView m, FrameworkElement anchor)
+        /// <summary>
+        /// 打开弹框（Git CodeLens 式）：activity=false 显示提交表格，true 显示 Team Activity 图表。
+        /// 悬停或点击均可打开；鼠标离开弹框后自动关闭。
+        /// </summary>
+        private void OpenPopup(MethodBlameView m, FrameworkElement anchor, bool activity)
         {
             try
             {
+                CancelCloseTimer();
                 _popup.IsOpen = false;
 
                 var panel = new StackPanel { Orientation = Orientation.Vertical };
                 panel.Children.Add(new TextBlock
                 {
-                    Text = "正在读取提交历史…",
+                    Text = "Loading…",
                     FontSize = 11,
                     Foreground = Brushes.Gray
                 });
-                var border = new Border
-                {
-                    BorderThickness = new Thickness(1),
-                    Padding = new Thickness(8),
-                    MaxWidth = 460,
-                    Child = panel
-                };
-                try
-                {
-                    // 跟随 VS 主题（浅色/深色）
-                    border.SetResourceReference(Border.BackgroundProperty,
-                        Microsoft.VisualStudio.Shell.VsBrushes.ToolWindowBackgroundKey);
-                    border.SetResourceReference(Border.BorderBrushProperty,
-                        Microsoft.VisualStudio.Shell.VsBrushes.ToolWindowBorderKey);
-                }
-                catch
-                {
-                    border.Background = Brushes.White;
-                    border.BorderBrush = new SolidColorBrush(Color.FromRgb(190, 190, 190));
-                }
+                var border = ThemedBorder(panel, new Thickness(10));
+                border.MouseEnter += (s, e) => CancelCloseTimer();
+                border.MouseLeave += (s, e) => ScheduleClose();
                 _popup.Child = border;
 
-                // 关键修复：装饰标签（anchor）会在每次重绘（滚动/编辑/数据到位）时被移除并重建。
-                // 若继续把它当作 Popup 的 PlacementTarget，标签一被移除，Popup 就失去锚点而"飘走"。
-                // 改为在点击瞬间捕获标签的屏幕坐标，把 Popup 钉到稳定的文档视图（VisualElement，
-                // 永不被移除）上，由 CustomPopupPlacementCallback 据此重新定位，重绘不再影响它。
+                // 稳定锚点（防飘走）：捕获打开瞬间的屏幕坐标，把 Popup 钉到稳定的文档视图元素上，
+                // 装饰标签被重绘移除/重建也不会拖动弹框。
                 try
                 {
                     _popupAnchorScreen = anchor.PointToScreen(new Point(0, Math.Max(anchor.ActualHeight, 14)));
@@ -497,7 +575,7 @@ namespace SvnMethodLens.Editor
                 _popup.PlacementTarget = _view.VisualElement;
                 _popup.Placement = PlacementMode.Custom;
                 _popup.CustomPopupPlacementCallback = PlacePopup;
-                _popup.StaysOpen = false;
+                _popup.StaysOpen = true;
                 _popup.AllowsTransparency = true;
                 _popup.IsOpen = true;
 
@@ -505,14 +583,50 @@ namespace SvnMethodLens.Editor
                 var revisions = m.Revisions;
                 Task.Run(async () =>
                 {
-                    var commits = await _blame.GetCommitsAsync(path, revisions);
-                    await _view.VisualElement.Dispatcher.InvokeAsync(() => FillPopup(panel, m, commits));
+                    var commits = await _blame.GetCommitsAsync(path, revisions, 30);
+                    await _view.VisualElement.Dispatcher.InvokeAsync(() =>
+                    {
+                        if (!_popup.IsOpen) return;
+                        if (activity) FillActivity(panel, m, commits);
+                        else FillCommits(panel, m, commits);
+                    });
                 });
             }
             catch (Exception ex)
             {
                 BlameService.Log("popup error: " + ex.Message);
             }
+        }
+
+        private void ClosePopup()
+        {
+            CancelHover();
+            CancelCloseTimer();
+            _popup.IsOpen = false;
+        }
+
+        /// <summary>跟随 VS 主题的弹框容器（浅色/深色）。</summary>
+        private static Border ThemedBorder(FrameworkElement child, Thickness padding)
+        {
+            var border = new Border
+            {
+                BorderThickness = new Thickness(1),
+                Padding = padding,
+                Child = child
+            };
+            try
+            {
+                border.SetResourceReference(Border.BackgroundProperty,
+                    Microsoft.VisualStudio.Shell.VsBrushes.ToolWindowBackgroundKey);
+                border.SetResourceReference(Border.BorderBrushProperty,
+                    Microsoft.VisualStudio.Shell.VsBrushes.ToolWindowBorderKey);
+            }
+            catch
+            {
+                border.Background = Brushes.White;
+                border.BorderBrush = new SolidColorBrush(Color.FromRgb(190, 190, 190));
+            }
+            return border;
         }
 
         /// <summary>
@@ -544,16 +658,21 @@ namespace SvnMethodLens.Editor
             return new[] { new CustomPopupPlacement(new Point(0, targetSize.Height), PopupPrimaryAxis.None) };
         }
 
-        private static void FillPopup(StackPanel panel, MethodBlameView m, List<CommitInfo> commits)
+        private static readonly SolidColorBrush RowHoverBrush =
+            new SolidColorBrush(Color.FromArgb(28, 0, 122, 204));
+
+        private static readonly Color[] Palette =
+        {
+            Color.FromRgb(31, 119, 180), Color.FromRgb(214, 39, 40),
+            Color.FromRgb(44, 160, 44),  Color.FromRgb(148, 103, 189),
+            Color.FromRgb(255, 127, 14), Color.FromRgb(23, 190, 207),
+            Color.FromRgb(227, 119, 194), Color.FromRgb(188, 189, 34)
+        };
+
+        /// <summary>提交表格弹框（Git CodeLens 结构：表格 + Show all file changes + Changes in months）。</summary>
+        private void FillCommits(StackPanel panel, MethodBlameView m, List<CommitInfo> commits)
         {
             panel.Children.Clear();
-            panel.Children.Add(new TextBlock
-            {
-                Text = string.IsNullOrWhiteSpace(m.Name) ? "该方法" : m.Name,
-                FontWeight = FontWeights.Bold,
-                FontSize = 11,
-                Margin = new Thickness(0, 0, 0, 4)
-            });
 
             if (commits.Count == 0)
             {
@@ -566,32 +685,485 @@ namespace SvnMethodLens.Editor
                 return;
             }
 
-            foreach (var c in commits)
+            // 列：Revision | Description | Author | Date
+            var grid = new Grid();
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(76) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(150) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(74) });
+
+            AddHeaderRow(grid, "Revision", "Description", "Author", "Date");
+
+            var rowsHost = new StackPanel();
+            Grid.SetRow(rowsHost, 1);
+            grid.Children.Add(rowsHost);
+
+            var scroll = new ScrollViewer
             {
+                MaxHeight = 240,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                Content = grid
+            };
+            panel.Children.Add(scroll);
+
+            // 底栏：左侧「Show all file changes」链接，右侧「Changes in months」过滤
+            var bottom = new DockPanel { Margin = new Thickness(0, 6, 0, 0), LastChildFill = false };
+
+            var link = new TextBlock { FontSize = 11 };
+            var hl = new System.Windows.Documents.Hyperlink(
+                new System.Windows.Documents.Run("Show all file changes"))
+            { FontSize = 11 };
+            hl.Click += (s, e) => ShowFileHistory();
+            link.Inlines.Add(hl);
+            DockPanel.SetDock(link, Dock.Left);
+            bottom.Children.Add(link);
+
+            var filterPanel = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            filterPanel.Children.Add(new TextBlock
+            {
+                Text = "Changes in months: ",
+                FontSize = 11,
+                VerticalAlignment = VerticalAlignment.Center,
+                Foreground = Brushes.Gray
+            });
+            var monthsBox = new TextBox { Text = "12", Width = 36, FontSize = 11 };
+            filterPanel.Children.Add(monthsBox);
+            DockPanel.SetDock(filterPanel, Dock.Right);
+            bottom.Children.Add(filterPanel);
+            panel.Children.Add(bottom);
+
+            Action rebuild = () =>
+            {
+                int months = 12;
+                int.TryParse(monthsBox.Text.Trim(), out months);
+                if (months <= 0) months = 1200;
+                var cutoff = DateTime.Now.AddMonths(-months);
+                rowsHost.Children.Clear();
+                foreach (var c in commits)
+                {
+                    var local = c.Date == DateTime.MinValue ? DateTime.MinValue : c.Date.ToLocalTime();
+                    if (local != DateTime.MinValue && local < cutoff) continue;
+                    rowsHost.Children.Add(BuildCommitRow(m, c));
+                }
+            };
+            monthsBox.TextChanged += (s, e) => rebuild();
+            rebuild();
+        }
+
+        private static void AddHeaderRow(Grid grid, params string[] cells)
+        {
+            var r = grid.RowDefinitions.Count;
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            for (int i = 0; i < cells.Length; i++)
+                AddCell(grid, r, i, cells[i], gray: true);
+        }
+
+        private static void AddCell(Grid grid, int row, int col, string text, bool gray = false)
+        {
+            var tb = new TextBlock
+            {
+                Text = text,
+                FontSize = 11,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                Margin = new Thickness(2, 2, 6, 2),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            if (gray) tb.Foreground = Brushes.Gray;
+            Grid.SetRow(tb, row);
+            Grid.SetColumn(tb, col);
+            grid.Children.Add(tb);
+        }
+
+        private Border BuildCommitRow(MethodBlameView m, CommitInfo c)
+        {
+            var grid = new Grid();
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(76) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(150) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(74) });
+
+            var msg = (c.Message ?? "").Replace("\r", "").Replace("\n", " ");
+            if (msg.Length > 60) msg = msg.Substring(0, 60) + "…";
+
+            AddCell(grid, 0, 0, "r" + c.Revision);
+            AddCell(grid, 0, 1, msg);
+            AddCell(grid, 0, 2, c.Author, gray: true);
+            AddCell(grid, 0, 3,
+                c.Date == DateTime.MinValue ? "" : c.Date.ToLocalTime().ToString("yyyy/M/d"), gray: true);
+
+            var row = new Border
+            {
+                Child = grid,
+                Background = Brushes.Transparent,
+                Padding = new Thickness(0, 1, 0, 1)
+            };
+            row.MouseEnter += (s, e) => row.Background = RowHoverBrush;
+            row.MouseLeave += (s, e) => row.Background = Brushes.Transparent;
+
+            // Git CodeLens 的行右键菜单：View Commit Details / Send Email to {作者}
+            var menu = new ContextMenu();
+            var view = new MenuItem { Header = "View Commit Details" };
+            view.Click += (s, e) => ShowCommitDetail(c);
+            var mail = new MenuItem
+            {
+                Header = string.IsNullOrEmpty(c.Author) ? "Send Email" : $"Send Email to {c.Author}"
+            };
+            mail.Click += (s, e) => SendEmail(c);
+            menu.Items.Add(view);
+            menu.Items.Add(mail);
+            row.ContextMenu = menu;
+            return row;
+        }
+
+        /// <summary>Team Activity 图表（Git CodeLens 结构：标题 + 按作者着色的散点时间轴 + 图例）。</summary>
+        private void FillActivity(StackPanel panel, MethodBlameView m, List<CommitInfo> commits)
+        {
+            panel.Children.Clear();
+            var dated = commits
+                .Where(c => c.Date != DateTime.MinValue)
+                .OrderBy(c => c.Date)
+                .ToList();
+
+            if (dated.Count == 0)
+            {
+                panel.Children.Add(new TextBlock
+                {
+                    Text = "未取到提交历史（非 SVN 工作副本或无权限）",
+                    FontSize = 11,
+                    Foreground = Brushes.Gray
+                });
+                return;
+            }
+
+            var span = dated[dated.Count - 1].Date - dated[0].Date;
+            int overDays = Math.Max(1, (int)Math.Ceiling(span.TotalDays));
+            var authors = dated.Select(c => c.Author).Distinct().ToList();
+
+            panel.Children.Add(new TextBlock
+            {
+                Text = $"Team Activity: {dated.Count} {Pl(dated.Count, "change", "changes")} by " +
+                       $"{authors.Count} {Pl(authors.Count, "author", "authors")} over {overDays} days",
+                FontWeight = FontWeights.Bold,
+                FontSize = 11,
+                Margin = new Thickness(0, 0, 0, 6)
+            });
+
+            var content = new Grid();
+            content.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            content.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            var canvas = BuildActivityCanvas(dated, authors);
+            Grid.SetColumn(canvas, 0);
+            content.Children.Add(canvas);
+
+            var legend = BuildLegend(dated, authors);
+            Grid.SetColumn(legend, 1);
+            content.Children.Add(legend);
+
+            panel.Children.Add(content);
+        }
+
+        private UIElement BuildActivityCanvas(List<CommitInfo> dated, List<string> authors)
+        {
+            double w = 350, h = 110;
+            var canvas = new Canvas
+            {
+                Width = w,
+                Height = h,
+                Background = Brushes.Transparent,
+                ClipToBounds = true
+            };
+
+            var now = DateTime.UtcNow;
+            double maxDays = 1;
+            foreach (var c in dated)
+            {
+                var d = (now - c.Date.ToUniversalTime()).TotalDays;
+                if (d > maxDays) maxDays = d;
+            }
+
+            double laneH = (h - 18) / Math.Max(1, authors.Count);
+            double axisY = h - 16;
+            Func<double, double> xOf = days => 8 + (1 - days / maxDays) * (w - 30);
+
+            var axisBrush = new SolidColorBrush(Color.FromRgb(140, 140, 140));
+
+            // 轴（右侧=最近，向左越旧）与刻度
+            canvas.Children.Add(new System.Windows.Shapes.Line
+            {
+                X1 = 4, Y1 = axisY, X2 = w - 4, Y2 = axisY,
+                Stroke = axisBrush, StrokeThickness = 1
+            });
+            double[] steps = { 1, 2, 5, 10, 20, 30, 60, 90, 180, 365 };
+            double step = steps.Last(s => maxDays / s <= 6);
+            for (double d = 0; d <= maxDays; d += step)
+            {
+                double x = xOf(d);
+                canvas.Children.Add(new System.Windows.Shapes.Line
+                {
+                    X1 = x, Y1 = axisY, X2 = x, Y2 = axisY + 3,
+                    Stroke = axisBrush, StrokeThickness = 1
+                });
+                var lbl = new TextBlock
+                {
+                    Text = ((int)d).ToString(),
+                    FontSize = 9,
+                    Foreground = Brushes.Gray
+                };
+                Canvas.SetLeft(lbl, x - 8);
+                Canvas.SetTop(lbl, axisY + 4);
+                canvas.Children.Add(lbl);
+            }
+
+            // 每个提交一个点：x=天数，y=作者泳道
+            var authorColor = new Dictionary<string, Color>();
+            for (int i = 0; i < authors.Count; i++)
+                authorColor[authors[i]] = Palette[i % Palette.Length];
+
+            foreach (var c in dated)
+            {
+                double days = (now - c.Date.ToUniversalTime()).TotalDays;
+                double x = xOf(Math.Min(days, maxDays));
+                double y = Array.IndexOf(authors.ToArray(), c.Author) * laneH + laneH / 2;
+                var dot = new System.Windows.Shapes.Ellipse
+                {
+                    Width = 9,
+                    Height = 9,
+                    Fill = new SolidColorBrush(authorColor[c.Author]),
+                    Stroke = Brushes.White,
+                    StrokeThickness = 1,
+                    ToolTip = $"r{c.Revision} · {c.Author} · {c.Date.ToLocalTime():yyyy/M/d}"
+                };
+                Canvas.SetLeft(dot, x - 4.5);
+                Canvas.SetTop(dot, y - 4.5);
+                canvas.Children.Add(dot);
+            }
+            return canvas;
+        }
+
+        private static UIElement BuildLegend(List<CommitInfo> dated, List<string> authors)
+        {
+            var legend = new StackPanel
+            {
+                Orientation = Orientation.Vertical,
+                Margin = new Thickness(12, 0, 0, 0),
+                VerticalAlignment = VerticalAlignment.Top
+            };
+            for (int i = 0; i < authors.Count; i++)
+            {
+                var count = dated.Count(c => c.Author == authors[i]);
+                var item = new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    Margin = new Thickness(0, 2, 0, 2)
+                };
+                item.Children.Add(new System.Windows.Shapes.Rectangle
+                {
+                    Width = 10,
+                    Height = 10,
+                    Fill = new SolidColorBrush(Palette[i % Palette.Length]),
+                    Margin = new Thickness(0, 0, 5, 0),
+                    VerticalAlignment = VerticalAlignment.Center
+                });
+                item.Children.Add(new TextBlock
+                {
+                    Text = $"{authors[i]} ({count})",
+                    FontSize = 11,
+                    VerticalAlignment = VerticalAlignment.Center
+                });
+                legend.Children.Add(item);
+            }
+            return legend;
+        }
+
+        /// <summary>「Show all file changes」→ 文件级历史窗口（Revision/Author/Date/Message）。</summary>
+        private void ShowFileHistory()
+        {
+            try
+            {
+                var win = new Window
+                {
+                    Title = $"History - {System.IO.Path.GetFileName(_filePath)}",
+                    Width = 820,
+                    Height = 440
+                };
+                var grid = new Grid { Margin = new Thickness(8) };
+                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+
+                var header = new TextBlock
+                {
+                    Text = "File History (SVN log)",
+                    FontWeight = FontWeights.Bold,
+                    Margin = new Thickness(2, 0, 0, 6)
+                };
+                Grid.SetRow(header, 0);
+                grid.Children.Add(header);
+
+                var lv = new ListView { FontSize = 11 };
+                var gv = new GridView();
+                gv.Columns.Add(new GridViewColumn
+                {
+                    Header = "Revision", Width = 80,
+                    DisplayMemberBinding = new System.Windows.Data.Binding("RevisionText")
+                });
+                gv.Columns.Add(new GridViewColumn
+                {
+                    Header = "Author", Width = 110,
+                    DisplayMemberBinding = new System.Windows.Data.Binding("Author")
+                });
+                gv.Columns.Add(new GridViewColumn
+                {
+                    Header = "Date", Width = 150,
+                    DisplayMemberBinding = new System.Windows.Data.Binding("DateText")
+                });
+                gv.Columns.Add(new GridViewColumn
+                {
+                    Header = "Message", Width = 430,
+                    DisplayMemberBinding = new System.Windows.Data.Binding("Message")
+                });
+                lv.View = gv;
+                Grid.SetRow(lv, 1);
+                grid.Children.Add(lv);
+
+                win.Content = grid;
+                win.Show();
+
+                var path = _filePath;
+                Task.Run(async () =>
+                {
+                    var log = await _blame.GetFileLogAsync(path);
+                    await _view.VisualElement.Dispatcher.InvokeAsync(() =>
+                    {
+                        try
+                        {
+                            lv.ItemsSource = log.Select(c => new
+                            {
+                                RevisionText = "r" + c.Revision,
+                                c.Author,
+                                DateText = c.Date == DateTime.MinValue
+                                    ? ""
+                                    : c.Date.ToLocalTime().ToString("yyyy/M/d HH:mm:ss"),
+                                Message = (c.Message ?? "").Replace("\r", "").Replace("\n", " ")
+                            }).ToList();
+                        }
+                        catch { /* 窗口已关闭等情况 */ }
+                    });
+                });
+            }
+            catch (Exception ex)
+            {
+                BlameService.Log("history window error: " + ex.Message);
+            }
+        }
+
+        /// <summary>「View Commit Details」→ 单次提交的变更文件明细（svn log -v）。</summary>
+        private void ShowCommitDetail(CommitInfo c)
+        {
+            try
+            {
+                var path = _filePath;
+                int rev = c.Revision;
+                Task.Run(async () =>
+                {
+                    var detail = await _blame.GetCommitDetailAsync(path, rev);
+                    await _view.VisualElement.Dispatcher.InvokeAsync(() => ShowDetailWindow(detail));
+                });
+            }
+            catch (Exception ex)
+            {
+                BlameService.Log("detail error: " + ex.Message);
+            }
+        }
+
+        private void ShowDetailWindow(CommitDetail d)
+        {
+            try
+            {
+                var win = new Window
+                {
+                    Title = d.Commit.Revision > 0 ? $"Commit r{d.Commit.Revision}" : "Commit",
+                    Width = 760,
+                    Height = 420
+                };
+                var grid = new Grid { Margin = new Thickness(8) };
+                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+
                 var head = new TextBlock
                 {
-                    FontSize = 11,
-                    TextWrapping = TextWrapping.NoWrap,
-                    Margin = new Thickness(0, 2, 0, 0),
-                    Text = $"r{c.Revision} · {c.Author} · " +
-                           (c.Date == DateTime.MinValue ? "" : c.Date.ToLocalTime().ToString("yyyy-MM-dd HH:mm"))
+                    Text = $"r{d.Commit.Revision} · {d.Commit.Author} · " +
+                           (d.Commit.Date == DateTime.MinValue
+                               ? ""
+                               : d.Commit.Date.ToLocalTime().ToString("yyyy/M/d HH:mm")),
+                    FontWeight = FontWeights.Bold,
+                    FontSize = 12,
+                    Margin = new Thickness(2, 0, 0, 2)
                 };
-                panel.Children.Add(head);
+                Grid.SetRow(head, 0);
+                grid.Children.Add(head);
 
-                var msg = (c.Message ?? "").Trim();
-                if (msg.Length > 0)
+                var msg = new TextBlock
                 {
-                    var nl = msg.IndexOf('\n');
-                    if (nl >= 0) msg = msg.Substring(0, nl);
-                    if (msg.Length > 80) msg = msg.Substring(0, 80) + "…";
-                    panel.Children.Add(new TextBlock
-                    {
-                        Text = msg,
-                        FontSize = 11,
-                        Foreground = Brushes.Gray,
-                        TextWrapping = TextWrapping.NoWrap
-                    });
-                }
+                    Text = (d.Commit.Message ?? "").Trim(),
+                    FontSize = 11,
+                    Foreground = Brushes.Gray,
+                    Margin = new Thickness(2, 0, 0, 6),
+                    TextWrapping = TextWrapping.Wrap
+                };
+                Grid.SetRow(msg, 1);
+                grid.Children.Add(msg);
+
+                var lv = new ListView { FontSize = 11 };
+                var gv = new GridView();
+                gv.Columns.Add(new GridViewColumn
+                {
+                    Header = "Action", Width = 60,
+                    DisplayMemberBinding = new System.Windows.Data.Binding("Action")
+                });
+                gv.Columns.Add(new GridViewColumn
+                {
+                    Header = "Path", Width = 620,
+                    DisplayMemberBinding = new System.Windows.Data.Binding("Path")
+                });
+                lv.View = gv;
+                lv.ItemsSource = d.Paths.Select(p => new { p.Action, p.Path }).ToList();
+                Grid.SetRow(lv, 2);
+                grid.Children.Add(lv);
+
+                win.Content = grid;
+                win.Show();
+            }
+            catch (Exception ex)
+            {
+                BlameService.Log("detail window error: " + ex.Message);
+            }
+        }
+
+        /// <summary>「Send Email to {作者}」→ 打开系统邮件客户端（SVN 只有用户名，无邮箱时收件人留空）。</summary>
+        private static void SendEmail(CommitInfo c)
+        {
+            try
+            {
+                var subject = $"[SVN r{c.Revision}] {(c.Message ?? "").Trim()}";
+                if (subject.Length > 120) subject = subject.Substring(0, 120);
+                var addr = c.Author != null && c.Author.Contains("@") ? c.Author : "";
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = $"mailto:{addr}?subject={Uri.EscapeDataString(subject)}",
+                    UseShellExecute = true
+                });
+            }
+            catch (Exception ex)
+            {
+                BlameService.Log("mailto error: " + ex.Message);
             }
         }
     }
