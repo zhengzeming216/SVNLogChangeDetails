@@ -8,5 +8,5 @@ using System.Runtime.InteropServices;
 [assembly: AssemblyDescription("在方法名上方显示 SVN 行级归属（类 Git CodeLens）")]
 [assembly: AssemblyCompany("Marvin")]
 [assembly: AssemblyProduct("SVNLogChangeDetails")]
-[assembly: AssemblyVersion("1.1.1.0")]
-[assembly: AssemblyFileVersion("1.1.1.0")]
+[assembly: AssemblyVersion("1.1.2.0")]
+[assembly: AssemblyFileVersion("1.1.2.0")]

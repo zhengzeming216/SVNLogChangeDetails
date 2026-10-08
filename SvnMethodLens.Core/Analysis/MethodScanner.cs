@@ -64,10 +64,9 @@ public static class MethodScanner
                         p.Identifier.Text, p, p.AttributeLists));
                     break;
 
-                case LocalFunctionStatementSyntax lf:
-                    members.Add(Make(tree, MemberKind.LocalFunction, TypeChain(lf),
-                        lf.Identifier.Text + lf.ParameterList.ToString(), lf, null));
-                    break;
+                // 注意：局部函数（LocalFunctionStatementSyntax）故意不收录。
+                // 它声明在其它方法体内部，若作为独立单元会给方法体里也加标注（"方法里面还有 log"）。
+                // 其代码行仍归属外层方法，不影响统计。
 
                 case TypeDeclarationSyntax t: // class / struct / interface / record
                     members.Add(Make(tree, MemberKind.Type, NamespaceOf(t),

@@ -35,6 +35,9 @@ namespace SvnMethodLens.Editor
             var lines = text.Replace("\r\n", "\n").Split('\n');
             var members = new List<EditorMember>();
             var stack = new Stack<(int declLine, bool isMember)>();
+            // 当前已打开的“成员块”层数。>0 表示我们正在某个方法/属性体内部，
+            // 此时再出现的“像方法的块”是局部函数/嵌套访问器，不应作为独立标注。
+            int memberDepth = 0;
 
             int prevNonEmpty = -1;
             for (int i = 0; i < lines.Length; i++)
@@ -91,12 +94,21 @@ namespace SvnMethodLens.Editor
                     {
                         isMember = false;
                     }
+
+                    // 关键修复：落在某个已打开成员（方法/属性）体内部的“像方法的块”
+                    // 是局部函数 / 嵌套访问器 / switch 表达式 / 初始化器块等，不是独立单元，
+                    // 否则标注会被画到方法体内部（用户看到的“方法里面还有 log”）。
+                    if (isMember && memberDepth > 0)
+                        isMember = false;
+
+                    if (isMember) memberDepth++;
                     stack.Push((declLine, isMember));
                 }
 
                 for (int c = 0; c < closes && stack.Count > 0; c++)
                 {
                     var top = stack.Pop();
+                    if (top.isMember) memberDepth--;
                     if (top.isMember)
                     {
                         var name = ExtractName(lines[top.declLine]);
