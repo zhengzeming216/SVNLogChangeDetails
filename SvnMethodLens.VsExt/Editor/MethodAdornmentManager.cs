@@ -615,7 +615,7 @@ namespace SvnMethodLens.Editor
         /// <summary>当前弹框对应的段（CodeLens 选中态：保持浅灰高亮框 + 蓝色文字）。</summary>
         private TextBlock _activeSegment;
 
-        private TextBlock MakeSegment(MethodBlameView m, bool activity, string text, LensFont font)
+        private Border MakeSegment(MethodBlameView m, bool activity, string text, LensFont font)
         {
             var tb = new TextBlock
             {
@@ -629,7 +629,8 @@ namespace SvnMethodLens.Editor
             // v1.8.0：对齐 Git CodeLens 引用的悬停/选中样式——
             //   悬停 → 文字变蓝 + 浅灰圆角高亮框（不再是下划线）；
             //   弹框打开期间（选中态）→ 保持同样高亮，收起后恢复灰色。
-            // 外面包一层圆角 Border 充当高亮框，TextBlock 仍是可命中区域。
+            // TextBlock 放进圆角 Border 充当高亮框；返回 Border 加入面板
+            // （注意：WPF 一个元素只能有一个逻辑父级，不能把 tb 再加进 StackPanel）。
             var host = new Border
             {
                 Child = tb,
@@ -641,7 +642,7 @@ namespace SvnMethodLens.Editor
             host.MouseEnter += (s, e) => SetSegmentVisual(tb, true);
             host.MouseLeave += (s, e) => SetSegmentVisual(tb, false);
             tb.MouseLeftButtonUp += (s, e) => { OpenPopup(m, tb, activity); e.Handled = true; };
-            return tb;
+            return host;
         }
 
         /// <summary>悬停/选中态的浅灰高亮框颜色（半透明灰，浅色/深色主题都自然）。</summary>
