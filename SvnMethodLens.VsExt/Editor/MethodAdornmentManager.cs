@@ -139,6 +139,7 @@ namespace SvnMethodLens.Editor
         private bool _pumping;
         private bool _disposed;
         private int _redrawTick;
+        private double _lastViewportTop = double.NaN;
         private readonly System.Windows.Controls.Primitives.Popup _popup =
             new System.Windows.Controls.Primitives.Popup();
 
@@ -169,8 +170,10 @@ namespace SvnMethodLens.Editor
             if (e.NewSnapshot != e.OldSnapshot)
                 ScheduleRefresh();
             // 滚动时关闭详情弹框，避免它飘在已经滚走的代码上（这也是"飘走"的一种表现）
-            if (_popup.IsOpen && Math.Abs(e.NewViewportTop - e.OldViewportTop) > 0.5)
+            if (_popup.IsOpen && !double.IsNaN(_lastViewportTop) &&
+                Math.Abs(_view.ViewportTop - _lastViewportTop) > 0.5)
                 _popup.IsOpen = false;
+            _lastViewportTop = _view.ViewportTop;
             RedrawVisible();
         }
 
@@ -444,7 +447,7 @@ namespace SvnMethodLens.Editor
         }
 
         /// <summary>点击标注显示该方法的提交历史（按需 svn log，带缓存）。</summary>
-        private void ShowPopup(MethodBlameView m, UIElement anchor)
+        private void ShowPopup(MethodBlameView m, FrameworkElement anchor)
         {
             try
             {
