@@ -553,7 +553,7 @@ namespace SvnMethodLens.Editor
             //   段1「Baker, 42 days ago」（时间）→ Team Activity 时间线；
             //   段2「2 authors, 2 changes」→ 提交表格（log）
             // 首部固定加 " | "：与左侧 CodeLens 引用区分隔
-            var panel = new StackPanel { Orientation = Orientation.Horizontal };
+            var panel = new StackPanel { Orientation = Orientation.Horizontal, Tag = "SvnMethodLensLabel" };
             panel.Children.Add(MakeSeparator(" | ", font));
             panel.Children.Add(MakeSegment(m, true, FormatHead(m), font));
             panel.Children.Add(MakeSeparator(" | ", font));
@@ -736,37 +736,61 @@ namespace SvnMethodLens.Editor
                     FontSize = 11,
                     Foreground = Brushes.Gray
                 });
-                var border = ThemedBorder(panel, new Thickness(10));
-                _popup.Child = border;
-
                 // 稳定锚点（防飘走）：捕获打开瞬间的屏幕坐标，把 Popup 钉到稳定的文档视图元素上，
                 // 装饰标签被重绘移除/重建也不会拖动弹框。
                 try
                 {
                     _popupAnchorScreen = anchor.PointToScreen(new Point(0, Math.Max(anchor.ActualHeight, 14)));
+                    _popupAnchorTopScreen = anchor.PointToScreen(new Point(0, 0));
                 }
                 catch
                 {
                     _popupAnchorScreen = new Point(double.NaN, double.NaN);
+                    _popupAnchorTopScreen = new Point(double.NaN, double.NaN);
                 }
+
+                // Git CodeLens 式：优先往标签上方弹（带向下小箭头指向标签），上方放不下才往下
+                _popupAbove = PredictAbove();
+
                 _popup.PlacementTarget = _view.VisualElement;
                 _popup.Placement = PlacementMode.Custom;
                 _popup.CustomPopupPlacementCallback = PlacePopup;
                 _popup.StaysOpen = true;
                 _popup.AllowsTransparency = true;
+                _popup.Child = BuildPopupShell(panel);
                 _popup.IsOpen = true;
+                SetPopupModal(true); // 弹框打开期间屏蔽编辑器操作（滚动/按键/点击），收起后恢复
 
                 var path = _filePath;
                 var revisions = m.Revisions;
                 Task.Run(async () =>
                 {
-                    var commits = await _blame.GetCommitsAsync(path, revisions, 30);
+                    // 首屏：blame 修订（最新 30 个）立刻显示
+                    var commits = await _blame.GetCommitsAsync(path, revisions.OrderByDescending(r => r).Take(30).ToList(), 30);
                     await _view.VisualElement.Dispatcher.InvokeAsync(() =>
                     {
                         if (!_popup.IsOpen) return;
                         if (activity) FillActivity(panel, m, commits);
                         else FillCommits(panel, m, commits);
                     });
+
+                    // 深度历史：blame 只有每行最后一次修改，早期提交被覆盖；
+                    // 用 svn blame -r 逐代回溯拿全量（从方法创建至今），完成后刷新弹框
+                    try
+                    {
+                        var full = await _blame.GetMethodLogAsync(path, m.Name, m.StartLine, revisions);
+                        if (full.Count > commits.Count)
+                            await _view.VisualElement.Dispatcher.InvokeAsync(() =>
+                            {
+                                if (!_popup.IsOpen) return;
+                                if (activity) FillActivity(panel, m, full);
+                                else FillCommits(panel, m, full);
+                            });
+                    }
+                    catch (Exception ex)
+                    {
+                        BlameService.Log("deep history error: " + ex.Message);
+                    }
                 });
             }
             catch (Exception ex)
@@ -775,7 +799,128 @@ namespace SvnMethodLens.Editor
             }
         }
 
-        private void ClosePopup() => _popup.IsOpen = false;
+        private void ClosePopup()
+        {
+            SetPopupModal(false);
+            _popup.IsOpen = false;
+        }
+
+        // ---- 弹框打开期间的模态屏蔽：滚动/按键/点击编辑器都被拦截，收起弹框后才恢复 ----
+
+        private void SetPopupModal(bool on)
+        {
+            var el = _view.VisualElement;
+            if (on)
+            {
+                el.PreviewMouseWheel += BlockViewWheel;
+                el.PreviewKeyDown += BlockViewKey;
+                el.PreviewMouseLeftButtonDown += BlockViewClick;
+                el.PreviewMouseRightButtonDown += BlockViewClick;
+            }
+            else
+            {
+                el.PreviewMouseWheel -= BlockViewWheel;
+                el.PreviewKeyDown -= BlockViewKey;
+                el.PreviewMouseLeftButtonDown -= BlockViewClick;
+                el.PreviewMouseRightButtonDown -= BlockViewClick;
+            }
+        }
+
+        private void BlockViewWheel(object sender, MouseWheelEventArgs e) => e.Handled = true;
+
+        private void BlockViewKey(object sender, KeyEventArgs e)
+        {
+            if (e.Key == Key.Escape)
+            {
+                ClosePopup(); // Esc 也能收起
+            }
+            e.Handled = true; // 其余按键（翻页/方向/输入）一律屏蔽
+        }
+
+        private void BlockViewClick(object sender, MouseButtonEventArgs e)
+        {
+            // 点到标注的另一段：放行，让段自身的 MouseLeftButtonUp 完成弹框切换
+            if (IsInsideLensLabel(e.OriginalSource)) return;
+            // 点编辑器 = 仅收起弹框，本次点击不产生选中/改光标等效果
+            ClosePopup();
+            e.Handled = true;
+        }
+
+        /// <summary>点击源是否在 SVN 标注标签内部（通过标签根元素 Tag 识别）。</summary>
+        private static bool IsInsideLensLabel(object source)
+        {
+            var dep = source as DependencyObject;
+            while (dep != null)
+            {
+                if (dep is FrameworkElement fe && "SvnMethodLensLabel".Equals(fe.Tag as string))
+                    return true;
+                dep = VisualTreeHelper.GetParent(dep);
+            }
+            return false;
+        }
+
+        // ---- Git CodeLens 式弹框外壳：跟随主题的边框 + 指向标签的小箭头 ----
+
+        private bool _popupAbove = true;
+        private Point _popupAnchorTopScreen;
+
+        /// <summary>粗估弹框高度后判断上方是否放得下；放不下则往下弹。</summary>
+        private bool PredictAbove()
+        {
+            try
+            {
+                if (double.IsNaN(_popupAnchorTopScreen.X)) return true;
+                var workArea = SystemParameters.WorkArea;
+                return _popupAnchorTopScreen.Y - 360 > workArea.Top; // 360 ≈ 弹框最大高度 + 箭头 + 余量
+            }
+            catch { return true; }
+        }
+
+        /// <summary>弹框外壳：内容边框 + 指向标签的三角小箭头（上方弹时箭头在下沿，反之在上沿）。</summary>
+        private UIElement BuildPopupShell(FrameworkElement content)
+        {
+            var border = ThemedBorder(content, new Thickness(10));
+            var root = new Grid();
+            var caret = new System.Windows.Shapes.Polygon
+            {
+                Points = _popupAbove
+                    ? new PointCollection(new[] { new Point(0, 0), new Point(12, 0), new Point(6, 8) })
+                    : new PointCollection(new[] { new Point(0, 8), new Point(12, 8), new Point(6, 0) }),
+                StrokeThickness = 1,
+                HorizontalAlignment = HorizontalAlignment.Left,
+                Margin = new Thickness(16, 0, 0, 0)
+            };
+            try
+            {
+                caret.SetResourceReference(System.Windows.Shapes.Shape.FillProperty,
+                    Microsoft.VisualStudio.Shell.VsBrushes.ToolWindowBackgroundKey);
+                caret.SetResourceReference(System.Windows.Shapes.Shape.StrokeProperty,
+                    Microsoft.VisualStudio.Shell.VsBrushes.ToolWindowBorderKey);
+            }
+            catch
+            {
+                caret.Fill = Brushes.White;
+                caret.Stroke = new SolidColorBrush(Color.FromRgb(190, 190, 190));
+            }
+
+            if (_popupAbove)
+            {
+                root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                Grid.SetRow(border, 0);
+                Grid.SetRow(caret, 1);
+            }
+            else
+            {
+                root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                Grid.SetRow(caret, 0);
+                Grid.SetRow(border, 1);
+            }
+            root.Children.Add(border);
+            root.Children.Add(caret);
+            return root;
+        }
 
         /// <summary>跟随 VS 主题的弹框容器（浅色/深色）。</summary>
         private static Border ThemedBorder(FrameworkElement child, Thickness padding)
@@ -813,13 +958,21 @@ namespace SvnMethodLens.Editor
                 {
                     var targetTopLeft = _view.VisualElement.PointToScreen(new Point(0, 0));
                     double x = _popupAnchorScreen.X - targetTopLeft.X;
-                    double y = _popupAnchorScreen.Y - targetTopLeft.Y;
-
-                    // 若向下展开会超出屏幕底部，则翻到标签上方
                     var workArea = SystemParameters.WorkArea;
-                    if (_popupAnchorScreen.Y + popupSize.Height > workArea.Bottom)
-                        y = (_popupAnchorScreen.Y - popupSize.Height) - targetTopLeft.Y;
+                    bool above = _popupAbove;
 
+                    // 上方弹：弹框底沿在标签顶上方（箭头指向标签）；下方弹：顶沿在标签底下方
+                    double ScreenY(bool up) => up
+                        ? _popupAnchorTopScreen.Y - popupSize.Height - 2
+                        : _popupAnchorScreen.Y + 2;
+
+                    // 预期方向放不下则翻面
+                    if (above && ScreenY(true) - targetTopLeft.Y < workArea.Top - targetTopLeft.Y)
+                        above = false;
+                    if (!above && _popupAnchorScreen.Y + popupSize.Height + 2 > workArea.Bottom)
+                        above = true;
+
+                    double y = ScreenY(above) - targetTopLeft.Y;
                     return new[] { new CustomPopupPlacement(new Point(x, y), PopupPrimaryAxis.None) };
                 }
             }
@@ -911,7 +1064,8 @@ namespace SvnMethodLens.Editor
                 VerticalAlignment = VerticalAlignment.Center,
                 Foreground = Brushes.Gray
             });
-            var monthsBox = new TextBox { Text = "12", Width = 36, FontSize = 11 };
+            // 默认显示全部历史（含方法创建起的深度回溯）；填月份数可只看最近 N 个月
+            var monthsBox = new TextBox { Text = "", Width = 36, FontSize = 11 };
             filterPanel.Children.Add(monthsBox);
             DockPanel.SetDock(filterPanel, Dock.Right);
             bottom.Children.Add(filterPanel);
@@ -919,7 +1073,7 @@ namespace SvnMethodLens.Editor
 
             Action rebuild = () =>
             {
-                int months = 12;
+                int months = 0;
                 int.TryParse(monthsBox.Text.Trim(), out months);
                 if (months <= 0) months = 1200;
                 var cutoff = DateTime.Now.AddMonths(-months);

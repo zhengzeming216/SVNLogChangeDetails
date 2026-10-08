@@ -76,6 +76,8 @@ namespace SvnMethodLens.Editor
         private readonly ConcurrentDictionary<string, Task<List<CommitInfo>>> _logInflight = new();
         private readonly ConcurrentDictionary<string, List<CommitInfo>> _fileLogCache = new();
         private readonly ConcurrentDictionary<string, Task<List<CommitInfo>>> _fileLogInflight = new();
+        private readonly ConcurrentDictionary<string, List<CommitInfo>> _methodLogCache = new();
+        private readonly ConcurrentDictionary<string, Task<List<CommitInfo>>> _methodLogInflight = new();
 
         public BlameService()
         {
@@ -242,6 +244,159 @@ namespace SvnMethodLens.Editor
                 Log($"svn file log failed: {ex.Message}");
                 return new List<CommitInfo>();
             }
+        }
+
+        /// <summary>
+        /// 方法级完整历史：blame 只给每行"最后一次修改"的修订，早期提交会被后续修改覆盖；
+        /// 这里用 svn blame -r 更早版本 + svn cat 沿方法体逐代回溯，收集从创建至今的全部修订。
+        /// 结果按「文件 + 起始行 + 方法名」缓存。
+        /// </summary>
+        public async Task<List<CommitInfo>> GetMethodLogAsync(
+            string filePath, string methodName, int startLine, IList<int> knownRevisions)
+        {
+            var key = filePath + "|" + startLine + "|" + methodName;
+            if (_methodLogCache.TryGetValue(key, out var hit)) return hit;
+            var task = _methodLogInflight.GetOrAdd(key, _ =>
+                Task.Run(() => LoadMethodLogAsync(filePath, methodName, knownRevisions)));
+            try
+            {
+                var r = await task.ConfigureAwait(false);
+                _methodLogCache[key] = r;
+                return r;
+            }
+            finally
+            {
+                _methodLogInflight.TryRemove(key, out _);
+            }
+        }
+
+        private async Task<List<CommitInfo>> LoadMethodLogAsync(
+            string filePath, string methodName, IList<int> knownRevisions)
+        {
+            var found = new SortedSet<int>();
+            try
+            {
+                var root = GetWcRoot(filePath);
+                var rel = ToRelative(root, filePath);
+                foreach (var r in knownRevisions ?? new List<int>())
+                    if (r > 0) found.Add(r);
+
+                if (!string.IsNullOrEmpty(methodName) && found.Count > 0)
+                {
+                    var sw = Stopwatch.StartNew();
+                    int rev = found.Min, guard = 0;
+                    while (rev > 1 && ++guard <= 40 && sw.Elapsed.TotalSeconds < 120)
+                    {
+                        // blame 给每行修订（无内容），cat 给该版本内容——两者按行号对齐
+                        string blameXml, content;
+                        try
+                        {
+                            blameXml = RunSvn(root, $"blame --xml --non-interactive -r {rev - 1} -- \"{rel}\"");
+                            content = RunSvn(root, $"cat --non-interactive -r {rev - 1} -- \"{rel}\"");
+                        }
+                        catch
+                        {
+                            break; // 版本可能已不存在（文件后来才加入等）
+                        }
+                        var rangeRevs = MethodRevisionsAtRevision(blameXml, content, methodName);
+                        if (rangeRevs.Count == 0) break; // 该版本里已找不到方法 → 到创建提交为止
+                        bool added = rangeRevs.Any(r => !found.Contains(r));
+                        foreach (var r in rangeRevs) found.Add(r);
+                        int min = rangeRevs.Min();
+                        if (!added || min >= rev) break; // 没有更早的历史了
+                        rev = min;
+                    }
+                    Log($"method history {methodName}: {found.Count} revisions, walked {guard} epochs, {sw.Elapsed.TotalSeconds:F1}s");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"method log failed: {ex.Message}");
+            }
+
+            // 修订号 → 提交摘要（复用全量文件 log）
+            try
+            {
+                var fileLog = await GetFileLogAsync(filePath).ConfigureAwait(false);
+                var byRev = new Dictionary<int, CommitInfo>();
+                foreach (var c in fileLog) byRev[c.Revision] = c;
+                var list = new List<CommitInfo>();
+                foreach (var r in found)
+                {
+                    if (byRev.TryGetValue(r, out var c)) list.Add(c);
+                    else list.Add(new CommitInfo { Revision = r, Message = "(r" + r + ")" });
+                }
+                return list.OrderByDescending(c => c.Revision).ToList();
+            }
+            catch
+            {
+                return found.Select(r => new CommitInfo { Revision = r })
+                            .OrderByDescending(c => c.Revision).ToList();
+            }
+        }
+
+        /// <summary>
+        /// 在 blame --xml（每行修订）与 cat 内容（按行号对齐）中定位方法声明行，
+        /// 大括号配平找方法体范围，返回范围内出现过的全部修订。
+        /// </summary>
+        private static List<int> MethodRevisionsAtRevision(string blameXml, string content, string methodName)
+        {
+            var revs = new List<int>();
+            try
+            {
+                var doc = System.Xml.Linq.XDocument.Parse(blameXml);
+                var commits = doc.Descendants("entry")
+                    .Select(e => new
+                    {
+                        Line = int.TryParse((string)e.Attribute("line-number"), out var n) ? n : 0,
+                        Rev = int.TryParse(
+                            e.Descendants("commit")
+                             .Select(c => (string)c.Attribute("revision"))
+                             .FirstOrDefault(),
+                            out var r) ? r : 0
+                    })
+                    .Where(x => x.Line > 0 && x.Rev > 0)
+                    .OrderBy(x => x.Line)
+                    .ToList();
+                var lines = content.Replace("\r\n", "\n").Split('\n');
+
+                // 定位声明行：跳过注释行，找"方法名(" 的第一次出现
+                int decl = -1;
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    var t = lines[i];
+                    var trim = t.TrimStart();
+                    if (trim.StartsWith("//") || trim.StartsWith("*") || trim.StartsWith("/*")) continue;
+                    int p = t.IndexOf(methodName, StringComparison.Ordinal);
+                    if (p < 0) continue;
+                    int after = p + methodName.Length;
+                    while (after < t.Length && char.IsWhiteSpace(t[after])) after++;
+                    if (after < t.Length && t[after] == '(') { decl = i + 1; break; }
+                }
+                if (decl <= 0) return revs;
+
+                // 大括号配平找方法体结束行
+                int end = decl, depth = 0, seenOpen = 0;
+                for (int i = decl - 1; i < lines.Length && i < decl + 400; i++)
+                {
+                    foreach (var ch in lines[i])
+                    {
+                        if (ch == '{') { depth++; seenOpen++; }
+                        else if (ch == '}') depth--;
+                    }
+                    end = i + 1;
+                    if (seenOpen > 0 && depth <= 0) break;
+                }
+
+                var inRange = commits.Where(x => x.Line >= decl && x.Line <= end)
+                                     .Select(x => x.Rev).Distinct();
+                revs.AddRange(inRange);
+            }
+            catch (Exception ex)
+            {
+                Log("blame parse failed: " + ex.Message);
+            }
+            return revs;
         }
 
         /// <summary>单次提交的变更文件明细（svn log -v），供「View Commit Details」。</summary>
