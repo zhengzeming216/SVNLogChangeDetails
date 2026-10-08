@@ -698,6 +698,9 @@ namespace SvnMethodLens.Editor
 
             var rowsHost = new StackPanel();
             Grid.SetRow(rowsHost, 1);
+            // 关键：数据行宿主必须横跨全部 4 列；否则会被塞进第 0 列（76px 的
+            // Revision 列）里，Description/Author/Date 全部被裁掉只剩修订号。
+            Grid.SetColumnSpan(rowsHost, grid.ColumnDefinitions.Count);
             grid.Children.Add(rowsHost);
 
             var scroll = new ScrollViewer
@@ -756,12 +759,11 @@ namespace SvnMethodLens.Editor
             rebuild();
         }
 
+        /// <summary>表头固定放在第 0 行（此前用 RowDefinitions.Count 取行号会把表头排到数据下面）。</summary>
         private static void AddHeaderRow(Grid grid, params string[] cells)
         {
-            var r = grid.RowDefinitions.Count;
-            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             for (int i = 0; i < cells.Length; i++)
-                AddCell(grid, r, i, cells[i], gray: true);
+                AddCell(grid, 0, i, cells[i], gray: true);
         }
 
         private static void AddCell(Grid grid, int row, int col, string text, bool gray = false)
