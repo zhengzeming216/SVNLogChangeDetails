@@ -27,7 +27,10 @@ $filesJson = Join-Path $outDir 'files.json'
 $manifest  = Join-Path $root 'SvnMethodLens.VsExt\source.extension.vsixmanifest'
 $dist      = Join-Path $root 'dist'
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
-$vsix      = Join-Path $dist 'SVNLogChangeDetails-1.7.0.vsix'
+# Read version from the vsix manifest (regex, avoids XML type adapter issues)
+$version = (Select-String -Path $manifest -Pattern 'Identity Id="[^"]*" Version="([0-9.]+)"').Matches[0].Groups[1].Value
+Write-Host "Package version: $version"
+$vsix      = Join-Path $dist ('SVNLogChangeDetails-' + $version + '.vsix')
 
 # 4) package
 if (Test-Path $filesJson) {

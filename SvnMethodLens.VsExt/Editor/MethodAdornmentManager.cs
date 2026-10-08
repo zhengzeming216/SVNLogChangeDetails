@@ -207,6 +207,11 @@ namespace SvnMethodLens.Editor
         {
             _view.LayoutChanged -= OnLayoutChanged;
             _view.Closed -= OnClosed;
+            try
+            {
+                if (_hostWindow != null) _hostWindow.Deactivated -= OnHostWindowDeactivated;
+            }
+            catch { }
             try { _refWaitTimer?.Stop(); } catch { }
             try { _popup.IsOpen = false; _popup.Child = null; } catch { }
             lock (_gate) _disposed = true;
@@ -607,6 +612,9 @@ namespace SvnMethodLens.Editor
             return sep;
         }
 
+        /// <summary>当前弹框对应的段（CodeLens 选中态：保持浅灰高亮框 + 蓝色文字）。</summary>
+        private TextBlock _activeSegment;
+
         private TextBlock MakeSegment(MethodBlameView m, bool activity, string text, LensFont font)
         {
             var tb = new TextBlock
@@ -616,11 +624,50 @@ namespace SvnMethodLens.Editor
                 Text = text
             };
             ApplyLensFont(tb, font);
-            // 要求1：悬停 → 手指光标 + 下划线；点击 → 打开对应弹框
-            tb.MouseEnter += (s, e) => tb.TextDecorations = TextDecorations.Underline;
-            tb.MouseLeave += (s, e) => tb.TextDecorations = null;
+            tb.Tag = tb.Foreground; // 记住原始颜色（CodeLens 灰），悬停/选中结束后恢复
+
+            // v1.8.0：对齐 Git CodeLens 引用的悬停/选中样式——
+            //   悬停 → 文字变蓝 + 浅灰圆角高亮框（不再是下划线）；
+            //   弹框打开期间（选中态）→ 保持同样高亮，收起后恢复灰色。
+            // 外面包一层圆角 Border 充当高亮框，TextBlock 仍是可命中区域。
+            var host = new Border
+            {
+                Child = tb,
+                Background = Brushes.Transparent,
+                CornerRadius = new CornerRadius(3),
+                Padding = new Thickness(3, 0, 3, 0)
+            };
+            host.Tag = "SvnMethodLensSegment";
+            host.MouseEnter += (s, e) => SetSegmentVisual(tb, true);
+            host.MouseLeave += (s, e) => SetSegmentVisual(tb, false);
             tb.MouseLeftButtonUp += (s, e) => { OpenPopup(m, tb, activity); e.Handled = true; };
             return tb;
+        }
+
+        /// <summary>悬停/选中态的浅灰高亮框颜色（半透明灰，浅色/深色主题都自然）。</summary>
+        private static readonly Brush SegmentHighlightBrush =
+            new SolidColorBrush(Color.FromArgb(28, 0, 0, 0));
+
+        /// <summary>悬停/选中态的文字颜色（VS 蓝）。</summary>
+        private static readonly Brush SegmentHotBrush =
+            new SolidColorBrush(Color.FromRgb(0, 120, 212));
+
+        /// <summary>按悬停/选中状态刷新一个段的外观。</summary>
+        private void SetSegmentVisual(TextBlock tb, bool hovered)
+        {
+            bool active = ReferenceEquals(tb, _activeSegment) && _popup.IsOpen;
+            if (tb.Parent is Border host)
+                host.Background = (hovered || active) ? SegmentHighlightBrush : Brushes.Transparent;
+            tb.Foreground = (hovered || active) ? SegmentHotBrush : (tb.Tag as Brush ?? GrayBrush());
+        }
+
+        /// <summary>弹框切换到某段时更新选中态；弹框收起时传 null 复原。</summary>
+        private void SetActiveSegment(TextBlock tb)
+        {
+            var old = _activeSegment;
+            _activeSegment = tb;
+            if (old != null) { try { SetSegmentVisual(old, false); } catch { } }
+            if (tb != null) { try { SetSegmentVisual(tb, false); } catch { } }
         }
 
         private static Brush _grayBrush;
@@ -760,6 +807,8 @@ namespace SvnMethodLens.Editor
                 _popup.Child = BuildPopupShell(panel);
                 _popup.IsOpen = true;
                 SetPopupModal(true); // 弹框打开期间屏蔽编辑器操作（滚动/按键/点击），收起后恢复
+                SetActiveSegment(anchor as TextBlock); // 选中态：点击的段保持高亮，与 CodeLens 一致
+                HookWindowDeactivation();
 
                 var path = _filePath;
                 var revisions = m.Revisions;
@@ -803,6 +852,29 @@ namespace SvnMethodLens.Editor
         {
             SetPopupModal(false);
             _popup.IsOpen = false;
+            SetActiveSegment(null); // 复原选中态高亮
+        }
+
+        // ---- VS 主窗口失焦时关闭弹框（对齐 CodeLens 引用弹框：点其他应用/文件夹即收起）----
+
+        private Window _hostWindow;
+
+        private void HookWindowDeactivation()
+        {
+            if (_hostWindow != null) return;
+            try
+            {
+                _hostWindow = Window.GetWindow(_view.VisualElement);
+                if (_hostWindow != null)
+                    _hostWindow.Deactivated += OnHostWindowDeactivated;
+            }
+            catch { }
+        }
+
+        private void OnHostWindowDeactivated(object sender, EventArgs e)
+        {
+            // 只有 VS 本体失活才关；VS 自己弹的子窗口（历史/详情）不算失焦
+            ClosePopup();
         }
 
         // ---- 弹框打开期间的模态屏蔽：滚动/按键/点击编辑器都被拦截，收起弹框后才恢复 ----
