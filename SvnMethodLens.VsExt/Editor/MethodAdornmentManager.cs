@@ -17,7 +17,30 @@ using Microsoft.VisualStudio.Utilities;
 namespace SvnMethodLens.Editor
 {
     /// <summary>
-    /// 监听 C# 文档视图的创建，为每个视图挂上方法级 SVN 归属装饰层。
+    /// 按当前线程 UI 区域语言返回中/英文案：
+    /// VS 英文界面显示英文（对齐 Git CodeLens 英文），中文界面显示中文（对齐 Git CodeLens 中文）。
+    /// VS 语言切换需要重启才生效，所以静态缓存是安全的。
+    /// </summary>
+    internal static class Loc
+    {
+        public static readonly bool Zh = InitZh();
+
+        private static bool InitZh()
+        {
+            try
+            {
+                return System.Globalization.CultureInfo.CurrentUICulture.TwoLetterISOLanguageName == "zh";
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static string T(string en, string zh) => Zh ? zh : en;
+    }
+
+    /// <summary>监听 C# 文档视图的创建，为每个视图挂上方法级 SVN 归属装饰层。
     /// 渲染策略（对齐 VS CodeLens 的做法）：
     ///  1) ILineTransformSource 在方法声明行上方预留一条空带（与 CodeLens"引用"共享，标注画在引用后面）；
     ///  2) 每次布局变化只把"当前视口内"的方法标注加入装饰层（滚动时自然补画），
@@ -325,10 +348,10 @@ namespace SvnMethodLens.Editor
                     var viewLine = lines.GetTextViewLineContainingBufferPosition(lineStart);
                     if (viewLine == null) { skipped++; continue; }
 
-                    // 横向：按 CodeLens 引用区的最坏宽度（"99+ references / 99+ 个引用"）预留空间，
-                    // 标注统一画在引用区右侧并加 " | " 分隔——不再与本地化的 "N 个引用" 重叠；
-                    // 若实际找到了引用元素且更宽（如超长 "1,234 references"），取更靠右者
-                    double labelX = IndentLeft(viewLine, snapshotLine, lineStart) + ReferenceReserveWidth();
+                    // 横向：优先紧贴实际检测到的 CodeLens 引用（"N references / N 个引用"），
+                    // 与 Git CodeLens 的排布一致，避免固定预留宽度造成的割裂感；
+                    // 引用元素没找到时（CodeLens 关闭/尚未渲染）才退回 "99+ references/个引用" 的预留宽度
+                    double labelX;
                     RefEdge best = null;
                     foreach (var r in refEdges)
                     {
@@ -336,8 +359,10 @@ namespace SvnMethodLens.Editor
                             (best == null || r.Right > best.Right))
                             best = r;
                     }
-                    if (best != null && best.Right + 6 > labelX)
+                    if (best != null)
                         labelX = best.Right + 6;
+                    else
+                        labelX = IndentLeft(viewLine, snapshotLine, lineStart) + ReferenceReserveWidth();
 
                     var label = CreateLabel(m);
                     Canvas.SetLeft(label, labelX);
@@ -546,19 +571,24 @@ namespace SvnMethodLens.Editor
             return tb;
         }
 
-        /// <summary>Git CodeLens 风格文案（段1：作者, 多久之前）。</summary>
+        /// <summary>Git CodeLens 风格文案（段1：作者, 多久之前）。中文用全角逗号，与 Git 中文版一致。</summary>
         private static string FormatHead(MethodBlameView m)
         {
-            if (m.HasLocal) return "Not committed yet";
+            if (m.HasLocal) return Loc.T("Not committed yet", "尚未提交");
             if (string.IsNullOrEmpty(m.LastAuthor)) return "";
             var when = m.LastDate.HasValue ? TimeAgo(m.LastDate.Value) : "";
-            return string.IsNullOrEmpty(when) ? m.LastAuthor : $"{m.LastAuthor}, {when}";
+            if (string.IsNullOrEmpty(when)) return m.LastAuthor;
+            return Loc.Zh ? $"{m.LastAuthor}，{when}" : $"{m.LastAuthor}, {when}";
         }
 
-        /// <summary>Git CodeLens 风格文案（段2：N 名作者, M 次更改）。</summary>
+        /// <summary>Git CodeLens 风格文案（段2：N 名作者, M 项更改）。中文无复数变化。</summary>
         private static string FormatTail(MethodBlameView m)
-            => $"{m.AuthorCount} {Pl(m.AuthorCount, "author", "authors")}, " +
-               $"{m.ChangeCount} {Pl(m.ChangeCount, "change", "changes")}";
+        {
+            if (Loc.Zh)
+                return $"{m.AuthorCount} 名作者，{m.ChangeCount} 项更改";
+            return $"{m.AuthorCount} {Pl(m.AuthorCount, "author", "authors")}, " +
+                   $"{m.ChangeCount} {Pl(m.ChangeCount, "change", "changes")}";
+        }
 
         private static string Pl(int n, string one, string many) => n == 1 ? one : many;
 
@@ -567,16 +597,26 @@ namespace SvnMethodLens.Editor
             try
             {
                 var span = DateTime.UtcNow - (utc.Kind == DateTimeKind.Utc ? utc : utc.ToUniversalTime());
-                if (span.TotalMinutes < 1) return "just now";
+                if (span.TotalMinutes < 1) return Loc.T("just now", "刚刚");
                 if (span.TotalHours < 1)
-                    return Pl((int)span.TotalMinutes, "1 minute ago", $"{(int)span.TotalMinutes} minutes ago");
+                    return Loc.Zh
+                        ? $"{(int)span.TotalMinutes} 分钟前"
+                        : Pl((int)span.TotalMinutes, "1 minute ago", $"{(int)span.TotalMinutes} minutes ago");
                 if (span.TotalDays < 1)
-                    return Pl((int)span.TotalHours, "1 hour ago", $"{(int)span.TotalHours} hours ago");
+                    return Loc.Zh
+                        ? $"{(int)span.TotalHours} 小时前"
+                        : Pl((int)span.TotalHours, "1 hour ago", $"{(int)span.TotalHours} hours ago");
                 if (span.TotalDays < 30)
-                    return Pl((int)span.TotalDays, "1 day ago", $"{(int)span.TotalDays} days ago");
+                    return Loc.Zh
+                        ? $"{(int)span.TotalDays} 天前"
+                        : Pl((int)span.TotalDays, "1 day ago", $"{(int)span.TotalDays} days ago");
                 if (span.TotalDays < 365)
-                    return Pl((int)(span.TotalDays / 30), "1 month ago", $"{(int)(span.TotalDays / 30)} months ago");
-                return Pl((int)(span.TotalDays / 365), "1 year ago", $"{(int)(span.TotalDays / 365)} years ago");
+                    return Loc.Zh
+                        ? $"{(int)(span.TotalDays / 30)} 个月前"
+                        : Pl((int)(span.TotalDays / 30), "1 month ago", $"{(int)(span.TotalDays / 30)} months ago");
+                return Loc.Zh
+                    ? $"{(int)(span.TotalDays / 365)} 年前"
+                    : Pl((int)(span.TotalDays / 365), "1 year ago", $"{(int)(span.TotalDays / 365)} years ago");
             }
             catch
             {
@@ -599,7 +639,7 @@ namespace SvnMethodLens.Editor
                 var panel = new StackPanel { Orientation = Orientation.Vertical };
                 panel.Children.Add(new TextBlock
                 {
-                    Text = "Loading…",
+                    Text = Loc.T("Loading…", "加载中…"),
                     FontSize = 11,
                     Foreground = Brushes.Gray
                 });
@@ -733,7 +773,11 @@ namespace SvnMethodLens.Editor
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(150) });
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(74) });
 
-            AddHeaderRow(grid, "Revision", "Description", "Author", "Date");
+            AddHeaderRow(grid,
+                Loc.T("Revision", "提交 ID"),
+                Loc.T("Description", "说明"),
+                Loc.T("Author", "作者"),
+                Loc.T("Date", "日期"));
 
             var rowsHost = new StackPanel();
             Grid.SetRow(rowsHost, 1);
@@ -755,7 +799,7 @@ namespace SvnMethodLens.Editor
 
             var link = new TextBlock { FontSize = 11 };
             var hl = new System.Windows.Documents.Hyperlink(
-                new System.Windows.Documents.Run("Show all file changes"))
+                new System.Windows.Documents.Run(Loc.T("Show all file changes", "显示所有的文件更改")))
             { FontSize = 11 };
             hl.Click += (s, e) => ShowFileHistory();
             link.Inlines.Add(hl);
@@ -769,7 +813,7 @@ namespace SvnMethodLens.Editor
             };
             filterPanel.Children.Add(new TextBlock
             {
-                Text = "Changes in months: ",
+                Text = Loc.T("Changes in months: ", "过去几个月的更改: "),
                 FontSize = 11,
                 VerticalAlignment = VerticalAlignment.Center,
                 Foreground = Brushes.Gray
@@ -849,7 +893,7 @@ namespace SvnMethodLens.Editor
 
             // 行右键菜单：只保留 View Commit Details
             var menu = new ContextMenu();
-            var view = new MenuItem { Header = "View Commit Details" };
+            var view = new MenuItem { Header = Loc.T("View Commit Details", "查看提交详情") };
             view.Click += (s, e) => ShowCommitDetail(c);
             menu.Items.Add(view);
             row.ContextMenu = menu;
@@ -882,8 +926,10 @@ namespace SvnMethodLens.Editor
 
             panel.Children.Add(new TextBlock
             {
-                Text = $"Team Activity: {dated.Count} {Pl(dated.Count, "change", "changes")} by " +
-                       $"{authors.Count} {Pl(authors.Count, "author", "authors")} over {overDays} days",
+                Text = Loc.Zh
+                    ? $"团队活动: {authors.Count} 名作者在 {overDays} 天内进行的 {dated.Count} 项更改"
+                    : $"Team Activity: {dated.Count} {Pl(dated.Count, "change", "changes")} by " +
+                      $"{authors.Count} {Pl(authors.Count, "author", "authors")} over {overDays} days",
                 FontWeight = FontWeights.Bold,
                 FontSize = 11,
                 Margin = new Thickness(0, 0, 0, 6)
@@ -965,7 +1011,7 @@ namespace SvnMethodLens.Editor
             // 右下角标题「Days ago」
             var cap = new TextBlock
             {
-                Text = "Days ago",
+                Text = Loc.T("Days ago", "天前"),
                 FontSize = 9,
                 Foreground = Brushes.Gray,
                 Width = w - 12,
@@ -1047,7 +1093,9 @@ namespace SvnMethodLens.Editor
                 ClosePopup();
                 var win = new Window
                 {
-                    Title = $"History - {System.IO.Path.GetFileName(_filePath)}",
+                    Title = Loc.T(
+                        $"History - {System.IO.Path.GetFileName(_filePath)}",
+                        $"历史 - {System.IO.Path.GetFileName(_filePath)}"),
                     Width = 820,
                     Height = 440
                 };
@@ -1057,7 +1105,7 @@ namespace SvnMethodLens.Editor
 
                 var header = new TextBlock
                 {
-                    Text = "File History (SVN log)",
+                    Text = Loc.T("File History (SVN log)", "文件历史 (SVN 日志)"),
                     FontWeight = FontWeights.Bold,
                     Margin = new Thickness(2, 0, 0, 6)
                 };
@@ -1068,22 +1116,22 @@ namespace SvnMethodLens.Editor
                 var gv = new GridView();
                 gv.Columns.Add(new GridViewColumn
                 {
-                    Header = "Revision", Width = 80,
+                    Header = Loc.T("Revision", "版本"), Width = 80,
                     DisplayMemberBinding = new System.Windows.Data.Binding("RevisionText")
                 });
                 gv.Columns.Add(new GridViewColumn
                 {
-                    Header = "Author", Width = 110,
+                    Header = Loc.T("Author", "作者"), Width = 110,
                     DisplayMemberBinding = new System.Windows.Data.Binding("Author")
                 });
                 gv.Columns.Add(new GridViewColumn
                 {
-                    Header = "Date", Width = 150,
+                    Header = Loc.T("Date", "日期"), Width = 150,
                     DisplayMemberBinding = new System.Windows.Data.Binding("DateText")
                 });
                 gv.Columns.Add(new GridViewColumn
                 {
-                    Header = "Message", Width = 430,
+                    Header = Loc.T("Message", "说明"), Width = 430,
                     DisplayMemberBinding = new System.Windows.Data.Binding("Message")
                 });
                 lv.View = gv;
@@ -1148,7 +1196,9 @@ namespace SvnMethodLens.Editor
             {
                 var win = new Window
                 {
-                    Title = d.Commit.Revision > 0 ? $"Commit r{d.Commit.Revision}" : "Commit",
+                    Title = d.Commit.Revision > 0
+                        ? Loc.T($"Commit r{d.Commit.Revision}", $"提交 r{d.Commit.Revision}")
+                        : Loc.T("Commit", "提交"),
                     Width = 760,
                     Height = 420
                 };
@@ -1185,12 +1235,12 @@ namespace SvnMethodLens.Editor
                 var gv = new GridView();
                 gv.Columns.Add(new GridViewColumn
                 {
-                    Header = "Action", Width = 60,
+                    Header = Loc.T("Action", "操作"), Width = 60,
                     DisplayMemberBinding = new System.Windows.Data.Binding("Action")
                 });
                 gv.Columns.Add(new GridViewColumn
                 {
-                    Header = "Path", Width = 620,
+                    Header = Loc.T("Path", "路径"), Width = 620,
                     DisplayMemberBinding = new System.Windows.Data.Binding("Path")
                 });
                 lv.View = gv;
