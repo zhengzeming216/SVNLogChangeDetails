@@ -355,6 +355,16 @@ namespace SvnMethodLens.Editor
                     var viewLine = lines.GetTextViewLineContainingBufferPosition(lineStart);
                     if (viewLine == null) { skipped++; continue; }
 
+                    // v1.9.0：折叠（outlining）区域内的成员不画标注。
+                    // 被折叠的行不可见，其 buffer 位置会被映射到折叠区首行（如 #region 行），
+                    // 若按 m.StartLine 继续画，标注就会堆叠在折叠行上（用户看到的"方法收起来还显示 log"）。
+                    // 判断方法：取回的行是否真的以该成员声明的行开头，不是就说明它被折叠遮住了。
+                    try
+                    {
+                        if (viewLine.Start.GetContainingLine().LineNumber != idx) { skipped++; continue; }
+                    }
+                    catch { skipped++; continue; }
+
                     // 横向：优先紧贴实际检测到的 CodeLens 引用（"N references / N 个引用"），
                     // 与 Git CodeLens 的排布一致，避免固定预留宽度造成的割裂感；
                     // 引用元素没找到时（CodeLens 关闭/尚未渲染）才退回 "99+ references/个引用" 的预留宽度
