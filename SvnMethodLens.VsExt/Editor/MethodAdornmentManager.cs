@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Media;
 using Microsoft.VisualStudio.Text;
 using Microsoft.VisualStudio.Text.Editor;
@@ -141,6 +142,9 @@ namespace SvnMethodLens.Editor
         private readonly System.Windows.Controls.Primitives.Popup _popup =
             new System.Windows.Controls.Primitives.Popup();
 
+        // 点击瞬间捕获的标签屏幕坐标；Popup 据此固定在稳定锚点上，不再随装饰重绘而漂走
+        private Point _popupAnchorScreen = new Point(double.NaN, double.NaN);
+
         public MethodAdornmentManager(IWpfTextView view, BlameService blame)
         {
             _view = view;
@@ -164,6 +168,9 @@ namespace SvnMethodLens.Editor
             // 文本变化才重算 blame；每次布局都补画视口内的标注（滚动靠这个续画）
             if (e.NewSnapshot != e.OldSnapshot)
                 ScheduleRefresh();
+            // 滚动时关闭详情弹框，避免它飘在已经滚走的代码上（这也是"飘走"的一种表现）
+            if (_popup.IsOpen && Math.Abs(e.NewViewportTop - e.OldViewportTop) > 0.5)
+                _popup.IsOpen = false;
             RedrawVisible();
         }
 
@@ -454,6 +461,7 @@ namespace SvnMethodLens.Editor
                 {
                     BorderThickness = new Thickness(1),
                     Padding = new Thickness(8),
+                    MaxWidth = 460,
                     Child = panel
                 };
                 try
@@ -470,8 +478,22 @@ namespace SvnMethodLens.Editor
                     border.BorderBrush = new SolidColorBrush(Color.FromRgb(190, 190, 190));
                 }
                 _popup.Child = border;
-                _popup.PlacementTarget = anchor;
-                _popup.Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom;
+
+                // 关键修复：装饰标签（anchor）会在每次重绘（滚动/编辑/数据到位）时被移除并重建。
+                // 若继续把它当作 Popup 的 PlacementTarget，标签一被移除，Popup 就失去锚点而"飘走"。
+                // 改为在点击瞬间捕获标签的屏幕坐标，把 Popup 钉到稳定的文档视图（VisualElement，
+                // 永不被移除）上，由 CustomPopupPlacementCallback 据此重新定位，重绘不再影响它。
+                try
+                {
+                    _popupAnchorScreen = anchor.PointToScreen(new Point(0, Math.Max(anchor.ActualHeight, 14)));
+                }
+                catch
+                {
+                    _popupAnchorScreen = new Point(double.NaN, double.NaN);
+                }
+                _popup.PlacementTarget = _view.VisualElement;
+                _popup.Placement = PlacementMode.Custom;
+                _popup.CustomPopupPlacementCallback = PlacePopup;
                 _popup.StaysOpen = false;
                 _popup.AllowsTransparency = true;
                 _popup.IsOpen = true;
@@ -488,6 +510,35 @@ namespace SvnMethodLens.Editor
             {
                 BlameService.Log("popup error: " + ex.Message);
             }
+        }
+
+        /// <summary>
+        /// 用点击瞬间捕获的标签屏幕坐标把弹框钉在固定位置。
+        /// PlacementTarget 是稳定的文档视图（VisualElement），因此装饰标签被移除/重建也不会让弹框漂移。
+        /// </summary>
+        private CustomPopupPlacement[] PlacePopup(Size popupSize, Size targetSize, Point offset)
+        {
+            try
+            {
+                if (!double.IsNaN(_popupAnchorScreen.X))
+                {
+                    var targetTopLeft = _view.VisualElement.PointToScreen(new Point(0, 0));
+                    double x = _popupAnchorScreen.X - targetTopLeft.X;
+                    double y = _popupAnchorScreen.Y - targetTopLeft.Y;
+
+                    // 若向下展开会超出屏幕底部，则翻到标签上方
+                    var workArea = SystemParameters.WorkArea;
+                    if (_popupAnchorScreen.Y + popupSize.Height > workArea.Bottom)
+                        y = (_popupAnchorScreen.Y - popupSize.Height) - targetTopLeft.Y;
+
+                    return new[] { new CustomPopupPlacement(new Point(x, y), PopupPrimaryAxis.None) };
+                }
+            }
+            catch
+            {
+                // 落到默认位置
+            }
+            return new[] { new CustomPopupPlacement(new Point(0, targetSize.Height), PopupPrimaryAxis.None) };
         }
 
         private static void FillPopup(StackPanel panel, MethodBlameView m, List<CommitInfo> commits)
