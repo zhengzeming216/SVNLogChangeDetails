@@ -27,7 +27,7 @@ $filesJson = Join-Path $outDir 'files.json'
 $manifest  = Join-Path $root 'SvnMethodLens.VsExt\source.extension.vsixmanifest'
 $dist      = Join-Path $root 'dist'
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
-$vsix      = Join-Path $dist 'SVNLogChangeDetails-1.5.0.vsix'
+$vsix      = Join-Path $dist 'SVNLogChangeDetails-1.6.0.vsix'
 
 # 4) package
 if (Test-Path $filesJson) {

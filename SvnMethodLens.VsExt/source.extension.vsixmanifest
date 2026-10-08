@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011">
   <Metadata>
-    <Identity Id="SvnMethodLens.9f1c2b3a-4d5e-4f6a-8b1c-2d3e4f5a6b7c" Version="1.5.0" Language="zh-CN" Publisher="Marvin" />
+    <Identity Id="SvnMethodLens.9f1c2b3a-4d5e-4f6a-8b1c-2d3e4f5a6b7c" Version="1.6.0" Language="zh-CN" Publisher="Marvin" />
     <DisplayName>SVN Log Change Details</DisplayName>
     <Description xml:space="preserve">在 C# 方法名上方显示 SVN 行级归属（最后修改人 / 改动次数 / 最后修订），类似 Git 的 CodeLens。无需 Git，直接读取 SVN 工作副本的 blame 数据。需要 TortoiseSVN 的 svn.exe。</Description>
     <MoreInfoUrl>https://github.com/zhengzeming216/SVNLogChangeDetails</MoreInfoUrl>

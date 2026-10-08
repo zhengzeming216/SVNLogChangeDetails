@@ -9,6 +9,7 @@ using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Threading;
 using Microsoft.VisualStudio.Text;
 using Microsoft.VisualStudio.Text.Editor;
 using Microsoft.VisualStudio.Text.Formatting;
@@ -206,6 +207,7 @@ namespace SvnMethodLens.Editor
         {
             _view.LayoutChanged -= OnLayoutChanged;
             _view.Closed -= OnClosed;
+            try { _refWaitTimer?.Stop(); } catch { }
             try { _popup.IsOpen = false; _popup.Child = null; } catch { }
             lock (_gate) _disposed = true;
         }
@@ -326,7 +328,7 @@ namespace SvnMethodLens.Editor
                 var snapshot = _view.TextSnapshot;
                 // 要求5：找到视口内 CodeLens "N references" 的位置，把标注画到引用后面（同一行）
                 var refEdges = CollectReferenceEdges();
-                int added = 0, failed = 0, skipped = 0;
+                int added = 0, failed = 0, skipped = 0, waitingRefs = 0;
                 string firstFail = null;
 
                 foreach (var m in data)
@@ -360,11 +362,32 @@ namespace SvnMethodLens.Editor
                             best = r;
                     }
                     if (best != null)
+                    {
                         labelX = best.Right + 6;
+                        // 与 CodeLens 引用完全同字体/字号/颜色：直接抄引用文本元素的字体规格
+                        if (best.Family != null && best.FontSize > 0)
+                            _lensFont = new LensFont
+                            {
+                                Family = best.Family,
+                                Size = best.FontSize,
+                                Brush = best.Foreground
+                            };
+                    }
                     else
+                    {
+                        // 要求6：log 与引用一起出现。CodeLens 引用还没渲染时先不画标注，
+                        // 安排 250ms 后重试（期间不显示 log），等引用出现的同一时刻再画；
+                        // 约 5 秒仍没有引用（CodeLens 被关闭等）才退回预留宽度位置。
+                        if (_refWaitAttempts < RefWaitMaxAttempts)
+                        {
+                            waitingRefs++;
+                            ScheduleRefWait();
+                            continue;
+                        }
                         labelX = IndentLeft(viewLine, snapshotLine, lineStart) + ReferenceReserveWidth();
+                    }
 
-                    var label = CreateLabel(m);
+                    var label = CreateLabel(m, _lensFont);
                     Canvas.SetLeft(label, labelX);
                     Canvas.SetTop(label, viewLine.Top + 1.0);
 
@@ -385,11 +408,19 @@ namespace SvnMethodLens.Editor
                     }
                 }
 
+                // 引用已全部就位：停止等待重试并重置预算，下次（滚动到新区域）重新等满
+                if (waitingRefs == 0 && _refWaitTimer != null && _refWaitTimer.IsEnabled)
+                {
+                    _refWaitTimer.Stop();
+                    _refWaitAttempts = 0;
+                }
+
                 // 日志降噪：只在异常或每 25 次重画时输出一行
                 _redrawTick++;
                 if (failed > 0 || _redrawTick % 25 == 1)
                     BlameService.Log($"visible redraw: view={System.IO.Path.GetFileName(_filePath)} " +
-                                     $"viewport=[{first},{last}] added={added} failed={failed} skipped={skipped}" +
+                                     $"viewport=[{first},{last}] added={added} failed={failed} skipped={skipped} " +
+                                     $"waitingRefs={waitingRefs} attempt={_refWaitAttempts}" +
                                      (firstFail != null ? " fail=\"" + firstFail + "\"" : ""));
             }
             catch (Exception ex)
@@ -440,6 +471,41 @@ namespace SvnMethodLens.Editor
         {
             public double Top;
             public double Right;
+            public FontFamily Family;   // 引用文本的字体（抄给标注用，保证外观一致）
+            public double FontSize;
+            public Brush Foreground;
+        }
+
+        /// <summary>从 CodeLens 引用文本元素抄来的字体规格，让标注与引用完全同字体同字号同颜色。</summary>
+        private sealed class LensFont
+        {
+            public FontFamily Family;
+            public double Size;
+            public Brush Brush;
+        }
+
+        private LensFont _lensFont;              // 最近一次成功抄到的 CodeLens 字体（跨重画缓存）
+        private DispatcherTimer _refWaitTimer;   // 等待 CodeLens 引用渲染的重试计时器
+        private int _refWaitAttempts;            // 已重试次数
+        private const int RefWaitMaxAttempts = 20; // 20 × 250ms ≈ 5 秒后放弃等待，退回预留宽度
+
+        /// <summary>等待 CodeLens 引用渲染的短重试：让标注与引用同一时刻出现，而不是先 log 后引用。</summary>
+        private void ScheduleRefWait()
+        {
+            if (_refWaitTimer == null)
+            {
+                _refWaitTimer = new DispatcherTimer(DispatcherPriority.Background)
+                {
+                    Interval = TimeSpan.FromMilliseconds(250)
+                };
+                _refWaitTimer.Tick += (s, e) =>
+                {
+                    _refWaitTimer.Stop();
+                    _refWaitAttempts++;
+                    RedrawVisible();
+                };
+            }
+            if (!_refWaitTimer.IsEnabled) _refWaitTimer.Start();
         }
 
         /// <summary>遍历视觉树，收集视口内所有"N references"文本的右边界（文本坐标系）。</summary>
@@ -469,7 +535,10 @@ namespace SvnMethodLens.Editor
                         list.Add(new RefEdge
                         {
                             Top = tl.Y + _view.ViewportTop,
-                            Right = tl.X + tb.ActualWidth + _view.ViewportLeft
+                            Right = tl.X + tb.ActualWidth + _view.ViewportLeft,
+                            Family = tb.FontFamily,
+                            FontSize = tb.FontSize,
+                            Foreground = tb.Foreground
                         });
                     }
                     catch { }
@@ -478,17 +547,17 @@ namespace SvnMethodLens.Editor
             }
         }
 
-        private UIElement CreateLabel(MethodBlameView m)
+        private UIElement CreateLabel(MethodBlameView m, LensFont font)
         {
             // Git CodeLens 结构：两段式标签，各自可点击
             //   段1「Baker, 42 days ago」（时间）→ Team Activity 时间线；
             //   段2「2 authors, 2 changes」→ 提交表格（log）
-            // 首部固定加 " | "：与左侧 CodeLens 引用区（预留宽度）分隔
+            // 首部固定加 " | "：与左侧 CodeLens 引用区分隔
             var panel = new StackPanel { Orientation = Orientation.Horizontal };
-            panel.Children.Add(MakeSeparator(" | "));
-            panel.Children.Add(MakeSegment(m, true, FormatHead(m)));
-            panel.Children.Add(MakeSeparator(" | "));
-            panel.Children.Add(MakeSegment(m, false, FormatTail(m)));
+            panel.Children.Add(MakeSeparator(" | ", font));
+            panel.Children.Add(MakeSegment(m, true, FormatHead(m), font));
+            panel.Children.Add(MakeSeparator(" | ", font));
+            panel.Children.Add(MakeSegment(m, false, FormatTail(m), font));
             return panel;
         }
 
@@ -531,44 +600,68 @@ namespace SvnMethodLens.Editor
             }
         }
 
-        private TextBlock MakeSeparator(string text)
+        private TextBlock MakeSeparator(string text, LensFont font)
         {
-            var sep = new TextBlock { Text = text, FontSize = 11 };
-            try
-            {
-                sep.SetResourceReference(TextBlock.ForegroundProperty,
-                    Microsoft.VisualStudio.Shell.VsBrushes.GrayTextKey);
-            }
-            catch
-            {
-                sep.Foreground = new SolidColorBrush(Color.FromRgb(128, 128, 128));
-            }
+            var sep = new TextBlock { Text = text };
+            ApplyLensFont(sep, font);
             return sep;
         }
 
-        private TextBlock MakeSegment(MethodBlameView m, bool activity, string text)
+        private TextBlock MakeSegment(MethodBlameView m, bool activity, string text, LensFont font)
         {
             var tb = new TextBlock
             {
-                FontSize = 11,
                 TextWrapping = TextWrapping.NoWrap,
                 Cursor = Cursors.Hand,
                 Text = text
             };
-            try
-            {
-                tb.SetResourceReference(TextBlock.ForegroundProperty,
-                    Microsoft.VisualStudio.Shell.VsBrushes.GrayTextKey);
-            }
-            catch
-            {
-                tb.Foreground = new SolidColorBrush(Color.FromRgb(128, 128, 128));
-            }
+            ApplyLensFont(tb, font);
             // 要求1：悬停 → 手指光标 + 下划线；点击 → 打开对应弹框
             tb.MouseEnter += (s, e) => tb.TextDecorations = TextDecorations.Underline;
             tb.MouseLeave += (s, e) => tb.TextDecorations = null;
             tb.MouseLeftButtonUp += (s, e) => { OpenPopup(m, tb, activity); e.Handled = true; };
             return tb;
+        }
+
+        private static Brush _grayBrush;
+
+        /// <summary>
+        /// 让标注与 CodeLens 引用完全同字体/字号/颜色：优先用从引用文本元素抄来的规格。
+        /// 之前的两个毛病：
+        ///  1) 不显式设 FontFamily → 装饰元素继承编辑器的等宽字体（Consolas），行高与引用文字（UI 字体）对不上；
+        ///  2) Foreground 依赖 VsBrushes.GrayTextKey 资源解析，在装饰层里解析不到时落到默认黑色，比引用深。
+        /// 抄不到 CodeLens 字体（引用尚未渲染/被关闭）时退回 Segoe UI 11px + 灰色。
+        /// </summary>
+        private void ApplyLensFont(TextBlock tb, LensFont font)
+        {
+            var f = font ?? _lensFont;
+            if (f != null && f.Family != null && f.Size > 0)
+            {
+                tb.FontFamily = f.Family;
+                tb.FontSize = f.Size;
+                if (f.Brush != null) tb.Foreground = f.Brush;
+                return;
+            }
+            tb.FontFamily = new FontFamily("Segoe UI");
+            tb.FontSize = 11;
+            tb.Foreground = GrayBrush();
+        }
+
+        private static Brush GrayBrush()
+        {
+            if (_grayBrush == null)
+            {
+                Brush b = null;
+                try
+                {
+                    b = System.Windows.Application.Current?.TryFindResource(
+                            Microsoft.VisualStudio.Shell.VsBrushes.GrayTextKey) as Brush;
+                }
+                catch { }
+                if (b == null) b = new SolidColorBrush(Color.FromRgb(128, 128, 128));
+                _grayBrush = b;
+            }
+            return _grayBrush;
         }
 
         /// <summary>Git CodeLens 风格文案（段1：作者, 多久之前）。中文用全角逗号，与 Git 中文版一致。</summary>
