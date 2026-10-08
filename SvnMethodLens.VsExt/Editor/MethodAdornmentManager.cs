@@ -358,7 +358,7 @@ namespace SvnMethodLens.Editor
                     // 横向：优先紧贴实际检测到的 CodeLens 引用（"N references / N 个引用"），
                     // 与 Git CodeLens 的排布一致，避免固定预留宽度造成的割裂感；
                     // 引用元素没找到时（CodeLens 关闭/尚未渲染）才退回 "99+ references/个引用" 的预留宽度
-                    double labelX;
+                    double labelX, labelY;
                     RefEdge best = null;
                     foreach (var r in refEdges)
                     {
@@ -369,12 +369,17 @@ namespace SvnMethodLens.Editor
                     if (best != null)
                     {
                         labelX = best.Right + 6;
-                        // 与 CodeLens 引用完全同字体/字号/颜色：直接抄引用文本元素的字体规格
+                        // v1.8.1：纵向与引用文字严格对齐——用引用元素的顶边作为标注顶边
+                        // （原来固定 viewLine.Top + 1.0，会比引用低几个像素，看起来高度不一致）
+                        labelY = best.Top;
+                        // 与 CodeLens 引用完全同字体/字号/颜色/行高：直接抄引用文本元素的规格
                         if (best.Family != null && best.FontSize > 0)
                             _lensFont = new LensFont
                             {
                                 Family = best.Family,
                                 Size = best.FontSize,
+                                LineHeight = best.LineHeight,
+                                Stacking = best.Stacking,
                                 Brush = best.Foreground
                             };
                     }
@@ -390,11 +395,12 @@ namespace SvnMethodLens.Editor
                             continue;
                         }
                         labelX = IndentLeft(viewLine, snapshotLine, lineStart) + ReferenceReserveWidth();
+                        labelY = viewLine.Top + 1.0;
                     }
 
                     var label = CreateLabel(m, _lensFont);
                     Canvas.SetLeft(label, labelX);
-                    Canvas.SetTop(label, viewLine.Top + 1.0);
+                    Canvas.SetTop(label, labelY);
 
                     try
                     {
@@ -478,14 +484,18 @@ namespace SvnMethodLens.Editor
             public double Right;
             public FontFamily Family;   // 引用文本的字体（抄给标注用，保证外观一致）
             public double FontSize;
+            public double LineHeight;   // 引用文本的行高（NaN = 自动），抄过来保证行框高度一致
+            public LineStackingStrategy Stacking;
             public Brush Foreground;
         }
 
-        /// <summary>从 CodeLens 引用文本元素抄来的字体规格，让标注与引用完全同字体同字号同颜色。</summary>
+        /// <summary>从 CodeLens 引用文本元素抄来的字体规格，让标注与引用完全同字体同字号同颜色同行高。</summary>
         private sealed class LensFont
         {
             public FontFamily Family;
             public double Size;
+            public double LineHeight;   // NaN = 自动
+            public LineStackingStrategy Stacking;
             public Brush Brush;
         }
 
@@ -543,6 +553,8 @@ namespace SvnMethodLens.Editor
                             Right = tl.X + tb.ActualWidth + _view.ViewportLeft,
                             Family = tb.FontFamily,
                             FontSize = tb.FontSize,
+                            LineHeight = tb.LineHeight,
+                            Stacking = tb.LineStackingStrategy,
                             Foreground = tb.Foreground
                         });
                     }
@@ -649,17 +661,16 @@ namespace SvnMethodLens.Editor
         private static readonly Brush SegmentHighlightBrush =
             new SolidColorBrush(Color.FromArgb(28, 0, 0, 0));
 
-        /// <summary>悬停/选中态的文字颜色（VS 蓝）。</summary>
-        private static readonly Brush SegmentHotBrush =
-            new SolidColorBrush(Color.FromRgb(0, 120, 212));
+        /// <summary>点击选中后的文字颜色（黑色）。</summary>
+        private static readonly Brush SegmentActiveBrush = Brushes.Black;
 
-        /// <summary>按悬停/选中状态刷新一个段的外观。</summary>
+        /// <summary>按悬停/选中状态刷新一个段的外观：悬停只加背景；点击选中后文字变黑。</summary>
         private void SetSegmentVisual(TextBlock tb, bool hovered)
         {
             bool active = ReferenceEquals(tb, _activeSegment) && _popup.IsOpen;
             if (tb.Parent is Border host)
                 host.Background = (hovered || active) ? SegmentHighlightBrush : Brushes.Transparent;
-            tb.Foreground = (hovered || active) ? SegmentHotBrush : (tb.Tag as Brush ?? GrayBrush());
+            tb.Foreground = active ? SegmentActiveBrush : (tb.Tag as Brush ?? GrayBrush());
         }
 
         /// <summary>弹框切换到某段时更新选中态；弹框收起时传 null 复原。</summary>
@@ -687,6 +698,12 @@ namespace SvnMethodLens.Editor
             {
                 tb.FontFamily = f.Family;
                 tb.FontSize = f.Size;
+                // v1.8.1：连行高策略一起抄，否则行框高度和引用不一致（表现为两者上下错位）
+                if (!double.IsNaN(f.LineHeight) && f.LineHeight > 0)
+                {
+                    tb.LineHeight = f.LineHeight;
+                    tb.LineStackingStrategy = f.Stacking;
+                }
                 if (f.Brush != null) tb.Foreground = f.Brush;
                 return;
             }
