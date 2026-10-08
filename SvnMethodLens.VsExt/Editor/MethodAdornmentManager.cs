@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel.Composition;
-using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -326,10 +325,10 @@ namespace SvnMethodLens.Editor
                     var viewLine = lines.GetTextViewLineContainingBufferPosition(lineStart);
                     if (viewLine == null) { skipped++; continue; }
 
-                    // 横向：优先贴在 CodeLens "N references" 后面（同一行带内）；
-                    // 找不到引用（CodeLens 关闭或未渲染）时退回代码缩进位置
-                    double labelX = IndentLeft(viewLine, snapshotLine, lineStart);
-                    bool afterRef = false;
+                    // 横向：按 CodeLens 引用区的最坏宽度（"99+ references / 99+ 个引用"）预留空间，
+                    // 标注统一画在引用区右侧并加 " | " 分隔——不再与本地化的 "N 个引用" 重叠；
+                    // 若实际找到了引用元素且更宽（如超长 "1,234 references"），取更靠右者
+                    double labelX = IndentLeft(viewLine, snapshotLine, lineStart) + ReferenceReserveWidth();
                     RefEdge best = null;
                     foreach (var r in refEdges)
                     {
@@ -338,12 +337,9 @@ namespace SvnMethodLens.Editor
                             best = r;
                     }
                     if (best != null && best.Right + 6 > labelX)
-                    {
                         labelX = best.Right + 6;
-                        afterRef = true;
-                    }
 
-                    var label = CreateLabel(m, afterRef);
+                    var label = CreateLabel(m);
                     Canvas.SetLeft(label, labelX);
                     Canvas.SetTop(label, viewLine.Top + 1.0);
 
@@ -437,7 +433,8 @@ namespace SvnMethodLens.Editor
                 var child = VisualTreeHelper.GetChild(d, i);
                 if (child is TextBlock tb &&
                     !string.IsNullOrEmpty(tb.Text) &&
-                    tb.Text.IndexOf("reference", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                    (tb.Text.IndexOf("reference", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                     tb.Text.Contains("引用")) &&
                     tb.ActualWidth > 0)
                 {
                     try
@@ -456,19 +453,57 @@ namespace SvnMethodLens.Editor
             }
         }
 
-        private UIElement CreateLabel(MethodBlameView m, bool afterReferences)
+        private UIElement CreateLabel(MethodBlameView m)
         {
             // Git CodeLens 结构：两段式标签，各自可点击
             //   段1「Baker, 42 days ago」（时间）→ Team Activity 时间线；
             //   段2「2 authors, 2 changes」→ 提交表格（log）
+            // 首部固定加 " | "：与左侧 CodeLens 引用区（预留宽度）分隔
             var panel = new StackPanel { Orientation = Orientation.Horizontal };
-
-            if (afterReferences)
-                panel.Children.Add(MakeSeparator(" | "));
+            panel.Children.Add(MakeSeparator(" | "));
             panel.Children.Add(MakeSegment(m, true, FormatHead(m)));
             panel.Children.Add(MakeSeparator(" | "));
             panel.Children.Add(MakeSegment(m, false, FormatTail(m)));
             return panel;
+        }
+
+        private static double? _refReserveWidth;
+
+        /// <summary>
+        /// CodeLens 引用区的预留宽度：按最坏情况 "99+ references / 99+ 个引用" 的文字宽度设计。
+        /// 之前的做法是在视觉树里找引用文本的右边界，但中文 VS 显示的是「N 个引用」，
+        /// 只匹配英文 "reference" 会找不到 → 标注回退到缩进位置，直接压在引用上。
+        /// </summary>
+        private static double ReferenceReserveWidth()
+        {
+            if (!_refReserveWidth.HasValue)
+            {
+                double w = 0;
+                foreach (var s in new[] { "99+ references", "99+ 个引用" })
+                    w = Math.Max(w, MeasureTextWidth(s, 11));
+                _refReserveWidth = w + 12; // 文字宽 + 间距
+            }
+            return _refReserveWidth.Value;
+        }
+
+        private static double MeasureTextWidth(string text, double fontSize)
+        {
+            try
+            {
+                var ft = new FormattedText(
+                    text,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    FlowDirection.LeftToRight,
+                    new Typeface("Segoe UI"),
+                    fontSize,
+                    Brushes.Black,
+                    1.0);
+                return ft.Width;
+            }
+            catch
+            {
+                return text.Length * fontSize * 0.6;
+            }
         }
 
         private TextBlock MakeSeparator(string text)
@@ -812,17 +847,11 @@ namespace SvnMethodLens.Editor
             row.MouseEnter += (s, e) => row.Background = RowHoverBrush;
             row.MouseLeave += (s, e) => row.Background = Brushes.Transparent;
 
-            // Git CodeLens 的行右键菜单：View Commit Details / Send Email to {作者}
+            // 行右键菜单：只保留 View Commit Details
             var menu = new ContextMenu();
             var view = new MenuItem { Header = "View Commit Details" };
             view.Click += (s, e) => ShowCommitDetail(c);
-            var mail = new MenuItem
-            {
-                Header = string.IsNullOrEmpty(c.Author) ? "Send Email" : $"Send Email to {c.Author}"
-            };
-            mail.Click += (s, e) => SendEmail(c);
             menu.Items.Add(view);
-            menu.Items.Add(mail);
             row.ContextMenu = menu;
             return row;
         }
@@ -1014,6 +1043,8 @@ namespace SvnMethodLens.Editor
         {
             try
             {
+                // 先关掉 log 弹框：Popup 常驻顶层，会把刚打开的历史窗口遮住
+                ClosePopup();
                 var win = new Window
                 {
                     Title = $"History - {System.IO.Path.GetFileName(_filePath)}",
@@ -1095,6 +1126,8 @@ namespace SvnMethodLens.Editor
         {
             try
             {
+                // 先关掉 log 弹框：Popup 常驻顶层，会把刚打开的详情窗口遮住
+                ClosePopup();
                 var path = _filePath;
                 int rev = c.Revision;
                 Task.Run(async () =>
@@ -1174,24 +1207,5 @@ namespace SvnMethodLens.Editor
             }
         }
 
-        /// <summary>「Send Email to {作者}」→ 打开系统邮件客户端（SVN 只有用户名，无邮箱时收件人留空）。</summary>
-        private static void SendEmail(CommitInfo c)
-        {
-            try
-            {
-                var subject = $"[SVN r{c.Revision}] {(c.Message ?? "").Trim()}";
-                if (subject.Length > 120) subject = subject.Substring(0, 120);
-                var addr = c.Author != null && c.Author.Contains("@") ? c.Author : "";
-                Process.Start(new ProcessStartInfo
-                {
-                    FileName = $"mailto:{addr}?subject={Uri.EscapeDataString(subject)}",
-                    UseShellExecute = true
-                });
-            }
-            catch (Exception ex)
-            {
-                BlameService.Log("mailto error: " + ex.Message);
-            }
-        }
     }
 }
