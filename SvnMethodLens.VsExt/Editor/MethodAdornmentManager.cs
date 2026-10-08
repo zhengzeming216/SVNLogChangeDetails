@@ -20,7 +20,7 @@ namespace SvnMethodLens.Editor
     /// <summary>
     /// 监听 C# 文档视图的创建，为每个视图挂上方法级 SVN 归属装饰层。
     /// 渲染策略（对齐 VS CodeLens 的做法）：
-    ///  1) ILineTransformSource 在方法声明行上方预留一条空带（约 17px）；
+    ///  1) ILineTransformSource 在方法声明行上方预留一条空带（与 CodeLens"引用"共享，标注画在引用后面）；
     ///  2) 每次布局变化只把"当前视口内"的方法标注加入装饰层（滚动时自然补画），
     ///     因为 AddAdornment 只对已排版（formatted）的行生效，对未排版行会失败。
     /// </summary>
@@ -102,15 +102,9 @@ namespace SvnMethodLens.Editor
             _view = view;
         }
 
-        // 我们标注自身需要的高度
-        private const double LabelBand = 17.0;
-
-        // 让位给 VS 自带"N 个引用"（CodeLens）的高度：它的行变换与我们的是
-        // Max 合并而非相加，且它贴着文字上沿绘制（TextTop - 高度），
-        // 所以必须把空带加高，才能两行并存（引用在下、Svn 标注在上）。
-        private double CodeLensAllowance => Math.Max(12.0, _view.LineHeight * 0.8);
-
-        private double TotalTopSpace => LabelBand + CodeLensAllowance;
+        // 标注与 VS 自带"N 个引用"（CodeLens）共享同一条带：行变换按 Max 合并，
+        // 我们只需保证带高不小于自身高度；CodeLens 在时两者同行显示（标注在引用后面）。
+        private double TotalTopSpace => Math.Max(15.0, _view.LineHeight * 0.85);
 
         public LineTransform GetLineTransform(ITextViewLine line, double suggestedTopChange, ViewRelativePosition affinity)
         {
@@ -149,10 +143,6 @@ namespace SvnMethodLens.Editor
         // 点击瞬间捕获的标签屏幕坐标；Popup 据此固定在稳定锚点上，不再随装饰重绘而漂走
         private Point _popupAnchorScreen = new Point(double.NaN, double.NaN);
 
-        // Git CodeLens 式悬停交互：段上悬停 450ms 打开弹框；鼠标离开标签/弹框 250ms 后关闭
-        private System.Windows.Threading.DispatcherTimer _hoverTimer;
-        private System.Windows.Threading.DispatcherTimer _closeTimer;
-
         public MethodAdornmentManager(IWpfTextView view, BlameService blame)
         {
             _view = view;
@@ -178,13 +168,11 @@ namespace SvnMethodLens.Editor
             // 文本变化才重算 blame；每次布局都补画视口内的标注（滚动靠这个续画）
             if (e.NewSnapshot != e.OldSnapshot)
                 ScheduleRefresh();
-            // 滚动时关闭详情弹框，避免它飘在已经滚走的代码上（这也是"飘走"的一种表现）
+            // 滚动时关闭详情弹框，避免它飘在已经滚走的代码上
             if (_popup.IsOpen && !double.IsNaN(_lastViewportTop) &&
                 Math.Abs(_view.ViewportTop - _lastViewportTop) > 0.5)
             {
                 _popup.IsOpen = false;
-                CancelHover();
-                CancelCloseTimer();
             }
             _lastViewportTop = _view.ViewportTop;
             RedrawVisible();
@@ -197,8 +185,6 @@ namespace SvnMethodLens.Editor
             _view.LayoutChanged -= OnLayoutChanged;
             _view.Closed -= OnClosed;
             try { _popup.IsOpen = false; _popup.Child = null; } catch { }
-            CancelHover();
-            CancelCloseTimer();
             lock (_gate) _disposed = true;
         }
 
@@ -316,6 +302,8 @@ namespace SvnMethodLens.Editor
                 int lo = first - 2, hi = last + 2;
 
                 var snapshot = _view.TextSnapshot;
+                // 要求5：找到视口内 CodeLens "N references" 的位置，把标注画到引用后面（同一行）
+                var refEdges = CollectReferenceEdges();
                 int added = 0, failed = 0, skipped = 0;
                 string firstFail = null;
 
@@ -338,8 +326,25 @@ namespace SvnMethodLens.Editor
                     var viewLine = lines.GetTextViewLineContainingBufferPosition(lineStart);
                     if (viewLine == null) { skipped++; continue; }
 
-                    var label = CreateLabel(m);
-                    Canvas.SetLeft(label, IndentLeft(viewLine, snapshotLine, lineStart));
+                    // 横向：优先贴在 CodeLens "N references" 后面（同一行带内）；
+                    // 找不到引用（CodeLens 关闭或未渲染）时退回代码缩进位置
+                    double labelX = IndentLeft(viewLine, snapshotLine, lineStart);
+                    bool afterRef = false;
+                    RefEdge best = null;
+                    foreach (var r in refEdges)
+                    {
+                        if (r.Top >= viewLine.Top - 6 && r.Top <= viewLine.Top + 28 &&
+                            (best == null || r.Right > best.Right))
+                            best = r;
+                    }
+                    if (best != null && best.Right + 6 > labelX)
+                    {
+                        labelX = best.Right + 6;
+                        afterRef = true;
+                    }
+
+                    var label = CreateLabel(m, afterRef);
+                    Canvas.SetLeft(label, labelX);
                     Canvas.SetTop(label, viewLine.Top + 1.0);
 
                     try
@@ -409,13 +414,66 @@ namespace SvnMethodLens.Editor
             }
         }
 
-        private UIElement CreateLabel(MethodBlameView m)
+        /// <summary>CodeLens "N references" 在文本坐标里的位置（用于把标注排到引用后面）。</summary>
+        private sealed class RefEdge
         {
-            // Git CodeLens 结构：两段式标签，各自可悬停
-            //   段1「Baker, 42 days ago」→ 提交表格弹框；段2「2 authors, 2 changes」→ Team Activity 图表
+            public double Top;
+            public double Right;
+        }
+
+        /// <summary>遍历视觉树，收集视口内所有"N references"文本的右边界（文本坐标系）。</summary>
+        private List<RefEdge> CollectReferenceEdges()
+        {
+            var list = new List<RefEdge>();
+            try { Collect(_view.VisualElement, list); } catch { }
+            return list;
+        }
+
+        private void Collect(DependencyObject d, List<RefEdge> list)
+        {
+            int n = VisualTreeHelper.GetChildrenCount(d);
+            for (int i = 0; i < n; i++)
+            {
+                var child = VisualTreeHelper.GetChild(d, i);
+                if (child is TextBlock tb &&
+                    !string.IsNullOrEmpty(tb.Text) &&
+                    tb.Text.IndexOf("reference", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                    tb.ActualWidth > 0)
+                {
+                    try
+                    {
+                        var tl = tb.TransformToVisual(_view.VisualElement).Transform(new Point(0, 0));
+                        // 视口坐标 → 文本坐标（与 ITextViewLine.Top / Canvas 坐标同一坐标系）
+                        list.Add(new RefEdge
+                        {
+                            Top = tl.Y + _view.ViewportTop,
+                            Right = tl.X + tb.ActualWidth + _view.ViewportLeft
+                        });
+                    }
+                    catch { }
+                }
+                Collect(child, list);
+            }
+        }
+
+        private UIElement CreateLabel(MethodBlameView m, bool afterReferences)
+        {
+            // Git CodeLens 结构：两段式标签，各自可点击
+            //   段1「Baker, 42 days ago」（时间）→ Team Activity 时间线；
+            //   段2「2 authors, 2 changes」→ 提交表格（log）
             var panel = new StackPanel { Orientation = Orientation.Horizontal };
 
-            var sep = new TextBlock { Text = " | ", FontSize = 11 };
+            if (afterReferences)
+                panel.Children.Add(MakeSeparator(" | "));
+            panel.Children.Add(MakeSegment(m, true, FormatHead(m)));
+            panel.Children.Add(MakeSeparator(" | "));
+            panel.Children.Add(MakeSegment(m, false, FormatTail(m)));
+            return panel;
+        }
+
+        private TextBlock MakeSeparator(string text)
+        {
+            var sep = new TextBlock { Text = text, FontSize = 11 };
             try
             {
                 sep.SetResourceReference(TextBlock.ForegroundProperty,
@@ -425,11 +483,7 @@ namespace SvnMethodLens.Editor
             {
                 sep.Foreground = new SolidColorBrush(Color.FromRgb(128, 128, 128));
             }
-
-            panel.Children.Add(MakeSegment(m, false, FormatHead(m)));
-            panel.Children.Add(sep);
-            panel.Children.Add(MakeSegment(m, true, FormatTail(m)));
-            return panel;
+            return sep;
         }
 
         private TextBlock MakeSegment(MethodBlameView m, bool activity, string text)
@@ -450,56 +504,12 @@ namespace SvnMethodLens.Editor
             {
                 tb.Foreground = new SolidColorBrush(Color.FromRgb(128, 128, 128));
             }
-            tb.MouseEnter += (s, e) => BeginHover(m, tb, activity);
-            tb.MouseLeave += (s, e) => ScheduleClose();
-            tb.MouseLeftButtonUp += (s, e) => { CancelHover(); OpenPopup(m, tb, activity); e.Handled = true; };
+            // 要求1：悬停 → 手指光标 + 下划线；点击 → 打开对应弹框
+            tb.MouseEnter += (s, e) => tb.TextDecorations = TextDecorations.Underline;
+            tb.MouseLeave += (s, e) => tb.TextDecorations = null;
+            tb.MouseLeftButtonUp += (s, e) => { OpenPopup(m, tb, activity); e.Handled = true; };
             return tb;
         }
-
-        #region 悬停计时
-
-        private void BeginHover(MethodBlameView m, FrameworkElement anchor, bool activity)
-        {
-            CancelCloseTimer();
-            CancelHover();
-            var t = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(450) };
-            _hoverTimer = t;
-            t.Tick += (s, e) =>
-            {
-                t.Stop();
-                if (_hoverTimer == t) _hoverTimer = null;
-                OpenPopup(m, anchor, activity);
-            };
-            t.Start();
-        }
-
-        private void CancelHover()
-        {
-            if (_hoverTimer != null) { _hoverTimer.Stop(); _hoverTimer = null; }
-        }
-
-        private void ScheduleClose()
-        {
-            CancelHover();
-            if (!_popup.IsOpen) return;
-            CancelCloseTimer();
-            var t = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
-            _closeTimer = t;
-            t.Tick += (s, e) =>
-            {
-                t.Stop();
-                if (_closeTimer == t) _closeTimer = null;
-                _popup.IsOpen = false;
-            };
-            t.Start();
-        }
-
-        private void CancelCloseTimer()
-        {
-            if (_closeTimer != null) { _closeTimer.Stop(); _closeTimer = null; }
-        }
-
-        #endregion
 
         /// <summary>Git CodeLens 风格文案（段1：作者, 多久之前）。</summary>
         private static string FormatHead(MethodBlameView m)
@@ -540,14 +550,15 @@ namespace SvnMethodLens.Editor
         }
 
         /// <summary>
-        /// 打开弹框（Git CodeLens 式）：activity=false 显示提交表格，true 显示 Team Activity 图表。
-        /// 悬停或点击均可打开；鼠标离开弹框后自动关闭。
+        /// 打开弹框（点击式）：activity=true 显示 Team Activity 时间线，false 显示提交表格（log）。
+        /// 不再使用"鼠标离开自动关闭"——右键菜单弹出会给原 Popup 触发 MouseLeave，
+        /// 导致准备右击看详情时弹框先消失（已修复的 bug）。关闭只发生在：
+        /// 点击编辑器、滚动、点击另一段（重建内容）、视图关闭。
         /// </summary>
         private void OpenPopup(MethodBlameView m, FrameworkElement anchor, bool activity)
         {
             try
             {
-                CancelCloseTimer();
                 _popup.IsOpen = false;
 
                 var panel = new StackPanel { Orientation = Orientation.Vertical };
@@ -558,8 +569,6 @@ namespace SvnMethodLens.Editor
                     Foreground = Brushes.Gray
                 });
                 var border = ThemedBorder(panel, new Thickness(10));
-                border.MouseEnter += (s, e) => CancelCloseTimer();
-                border.MouseLeave += (s, e) => ScheduleClose();
                 _popup.Child = border;
 
                 // 稳定锚点（防飘走）：捕获打开瞬间的屏幕坐标，把 Popup 钉到稳定的文档视图元素上，
@@ -598,12 +607,7 @@ namespace SvnMethodLens.Editor
             }
         }
 
-        private void ClosePopup()
-        {
-            CancelHover();
-            CancelCloseTimer();
-            _popup.IsOpen = false;
-        }
+        private void ClosePopup() => _popup.IsOpen = false;
 
         /// <summary>跟随 VS 主题的弹框容器（浅色/深色）。</summary>
         private static Border ThemedBorder(FrameworkElement child, Thickness padding)
@@ -873,13 +877,17 @@ namespace SvnMethodLens.Editor
 
         private UIElement BuildActivityCanvas(List<CommitInfo> dated, List<string> authors)
         {
-            double w = 350, h = 110;
+            double w = 350;
+            double laneH = 22;
+            double plotH = Math.Max(60, authors.Count * laneH); // 散点绘图区
+            double axisH = 32;                                  // 底部时间轴区域（刻度数字 + Days ago）
+            double h = plotH + axisH;
+
             var canvas = new Canvas
             {
                 Width = w,
                 Height = h,
-                Background = Brushes.Transparent,
-                ClipToBounds = true
+                Background = Brushes.Transparent
             };
 
             var now = DateTime.UtcNow;
@@ -890,49 +898,66 @@ namespace SvnMethodLens.Editor
                 if (d > maxDays) maxDays = d;
             }
 
-            double laneH = (h - 18) / Math.Max(1, authors.Count);
-            double axisY = h - 16;
+            double axisY = plotH - 6;
             Func<double, double> xOf = days => 8 + (1 - days / maxDays) * (w - 30);
 
             var axisBrush = new SolidColorBrush(Color.FromRgb(140, 140, 140));
 
-            // 轴（右侧=最近，向左越旧）与刻度
+            // 轴（右侧=最近，向左越旧）
             canvas.Children.Add(new System.Windows.Shapes.Line
             {
                 X1 = 4, Y1 = axisY, X2 = w - 4, Y2 = axisY,
                 Stroke = axisBrush, StrokeThickness = 1
             });
+
+            // 要求4：底部时间轴——刻度短线 + 天数数字（和参考截图一致）
             double[] steps = { 1, 2, 5, 10, 20, 30, 60, 90, 180, 365 };
-            double step = steps.Last(s => maxDays / s <= 6);
-            for (double d = 0; d <= maxDays; d += step)
+            double step = steps.Last(s => maxDays / s <= 8);
+            for (double d = 0; d <= maxDays + 0.5; d += step)
             {
                 double x = xOf(d);
                 canvas.Children.Add(new System.Windows.Shapes.Line
                 {
-                    X1 = x, Y1 = axisY, X2 = x, Y2 = axisY + 3,
+                    X1 = x, Y1 = axisY, X2 = x, Y2 = axisY + 4,
                     Stroke = axisBrush, StrokeThickness = 1
                 });
                 var lbl = new TextBlock
                 {
-                    Text = ((int)d).ToString(),
+                    Text = ((int)Math.Round(d)).ToString(),
                     FontSize = 9,
                     Foreground = Brushes.Gray
                 };
-                Canvas.SetLeft(lbl, x - 8);
-                Canvas.SetTop(lbl, axisY + 4);
+                double lx = Math.Min(Math.Max(x - 8, 0), w - 18);
+                Canvas.SetLeft(lbl, lx);
+                Canvas.SetTop(lbl, axisY + 6);
                 canvas.Children.Add(lbl);
             }
+
+            // 右下角标题「Days ago」
+            var cap = new TextBlock
+            {
+                Text = "Days ago",
+                FontSize = 9,
+                Foreground = Brushes.Gray,
+                Width = w - 12,
+                TextAlignment = TextAlignment.Right
+            };
+            Canvas.SetLeft(cap, 6);
+            Canvas.SetTop(cap, axisY + 18);
+            canvas.Children.Add(cap);
 
             // 每个提交一个点：x=天数，y=作者泳道
             var authorColor = new Dictionary<string, Color>();
             for (int i = 0; i < authors.Count; i++)
                 authorColor[authors[i]] = Palette[i % Palette.Length];
 
+            double dotTop = 4;
             foreach (var c in dated)
             {
                 double days = (now - c.Date.ToUniversalTime()).TotalDays;
                 double x = xOf(Math.Min(days, maxDays));
-                double y = Array.IndexOf(authors.ToArray(), c.Author) * laneH + laneH / 2;
+                double y = dotTop + Array.IndexOf(authors.ToArray(), c.Author) * laneH + laneH / 2;
+                if (y > axisY - 6) y = axisY - 6;
                 var dot = new System.Windows.Shapes.Ellipse
                 {
                     Width = 9,
