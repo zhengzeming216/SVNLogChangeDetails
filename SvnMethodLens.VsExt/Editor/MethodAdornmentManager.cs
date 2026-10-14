@@ -1612,6 +1612,22 @@ namespace SvnMethodLens.Editor
                 Grid.SetRow(lv, 2);
                 grid.Children.Add(lv);
 
+                // 空列表时给出明确提示：区分"真的没路径"和"取数失败"
+                if (d.Paths.Count == 0)
+                {
+                    var empty = new TextBlock
+                    {
+                        Text = Loc.T("No changed path in this revision (svn log -v returned nothing).",
+                                     "该提交没有可显示的路径（svn log -v 无输出）。"),
+                        FontSize = 11,
+                        Foreground = Brushes.Gray,
+                        Margin = new Thickness(6, 10, 0, 0),
+                        VerticalAlignment = VerticalAlignment.Top
+                    };
+                    Grid.SetRow(empty, 2);
+                    grid.Children.Add(empty);
+                }
+
                 // 当前文件在本次提交里的那一行（默认操作对象）
                 var ownPath = _filePath == null ? null : System.IO.Path.GetFileName(_filePath);
                 Func<ChangedPath> targetOf = () =>

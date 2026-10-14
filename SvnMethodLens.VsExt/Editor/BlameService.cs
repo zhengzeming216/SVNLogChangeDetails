@@ -42,11 +42,14 @@ namespace SvnMethodLens.Editor
         public string Message = "";
     }
 
-    /// <summary>提交明细中的一条变更路径（svn log -v 的 path 条目）。</summary>
+    /// <summary>
+    /// 提交明细中的一条变更路径（svn log -v 的 path 条目）。
+    /// 注意：必须是**属性**——WPF 的 Binding 不认字段，写成字段会让明细列表整列空白。
+    /// </summary>
     public sealed class ChangedPath
     {
-        public string Action = "";
-        public string Path = "";
+        public string Action { get; set; } = "";
+        public string Path { get; set; } = "";
     }
 
     /// <summary>单次提交的明细（含变更文件列表），供「View Commit Details」。</summary>
