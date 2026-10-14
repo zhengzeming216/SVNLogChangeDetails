@@ -1,12 +1,15 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel.Composition;
+using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
@@ -1238,11 +1241,22 @@ namespace SvnMethodLens.Editor
             row.MouseEnter += (s, e) => row.Background = RowHoverBrush;
             row.MouseLeave += (s, e) => row.Background = Brushes.Transparent;
 
-            // 行右键菜单：只保留 View Commit Details
+            // 双击记录 → 直接打开该提交的明细（与 TortoiseSVN 日志双击一致）
+            row.MouseLeftButtonDown += (s, e) =>
+            {
+                if (e.ClickCount != 2) return;
+                e.Handled = true;
+                ShowCommitDetail(c);
+            };
+
+            // 行右键菜单：View Commit Details + 查看变更（对应 TortoiseSVN 的两项）
             var menu = new ContextMenu();
             var view = new MenuItem { Header = Loc.T("View Commit Details", "查看提交详情") };
             view.Click += (s, e) => ShowCommitDetail(c);
             menu.Items.Add(view);
+            var showChanges = new MenuItem { Header = Loc.T("Show changes", "查看变更") };
+            showChanges.Click += (s, e) => ShowCommitDetail(c, autoShowChanges: true);
+            menu.Items.Add(showChanges);
             row.ContextMenu = menu;
             return row;
         }
@@ -1517,7 +1531,7 @@ namespace SvnMethodLens.Editor
         }
 
         /// <summary>「View Commit Details」→ 单次提交的变更文件明细（svn log -v）。</summary>
-        private void ShowCommitDetail(CommitInfo c)
+        private void ShowCommitDetail(CommitInfo c, bool autoShowChanges = false)
         {
             try
             {
@@ -1528,7 +1542,8 @@ namespace SvnMethodLens.Editor
                 Task.Run(async () =>
                 {
                     var detail = await _blame.GetCommitDetailAsync(path, rev);
-                    await _view.VisualElement.Dispatcher.InvokeAsync(() => ShowDetailWindow(detail));
+                    await _view.VisualElement.Dispatcher.InvokeAsync(
+                        () => ShowDetailWindow(detail, autoShowChanges));
                 });
             }
             catch (Exception ex)
@@ -1537,7 +1552,7 @@ namespace SvnMethodLens.Editor
             }
         }
 
-        private void ShowDetailWindow(CommitDetail d)
+        private void ShowDetailWindow(CommitDetail d, bool autoShowChanges = false)
         {
             try
             {
@@ -1546,13 +1561,14 @@ namespace SvnMethodLens.Editor
                     Title = d.Commit.Revision > 0
                         ? Loc.T($"Commit r{d.Commit.Revision}", $"提交 r{d.Commit.Revision}")
                         : Loc.T("Commit", "提交"),
-                    Width = 760,
-                    Height = 420
+                    Width = 860,
+                    Height = 460
                 };
                 var grid = new Grid { Margin = new Thickness(8) };
                 grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
                 grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
                 grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
                 var head = new TextBlock
                 {
@@ -1587,20 +1603,333 @@ namespace SvnMethodLens.Editor
                 });
                 gv.Columns.Add(new GridViewColumn
                 {
-                    Header = Loc.T("Path", "路径"), Width = 620,
+                    Header = Loc.T("Path", "路径"), Width = 700,
                     DisplayMemberBinding = new System.Windows.Data.Binding("Path")
                 });
                 lv.View = gv;
-                lv.ItemsSource = d.Paths.Select(p => new { p.Action, p.Path }).ToList();
+                lv.ItemsSource = d.Paths;
+                if (d.Paths.Count > 0) lv.SelectedIndex = 0;
                 Grid.SetRow(lv, 2);
                 grid.Children.Add(lv);
+
+                // 当前文件在本次提交里的那一行（默认操作对象）
+                var ownPath = _filePath == null ? null : System.IO.Path.GetFileName(_filePath);
+                Func<ChangedPath> targetOf = () =>
+                {
+                    if (lv.SelectedItem is ChangedPath sel) return sel;
+                    var own = d.Paths.FirstOrDefault(
+                        p => System.IO.Path.GetFileName(p.Path).Equals(ownPath, StringComparison.OrdinalIgnoreCase));
+                    return own ?? d.Paths.FirstOrDefault();
+                };
+
+                // 双击某一行 → 查看该文件在此提交的变更（对齐 TortoiseSVN 双击行为）
+                lv.MouseDoubleClick += (s, e) =>
+                {
+                    if (targetOf() is ChangedPath p) ShowRevisionChanges(d.Commit.Revision, p);
+                };
+
+                // 右键菜单：与 TortoiseSVN 日志里「Show changes / Show changes as unified diff」对应
+                var menu = new ContextMenu();
+                var miDiff = new MenuItem { Header = Loc.T("Show changes", "查看变更") };
+                miDiff.Click += (s, e) => { if (targetOf() is ChangedPath p) ShowRevisionChanges(d.Commit.Revision, p); };
+                menu.Items.Add(miDiff);
+
+                var miUnified = new MenuItem
+                {
+                    Header = Loc.T("Show changes as unified diff", "以 Unified Diff 查看变更")
+                };
+                miUnified.Click += (s, e) => { if (targetOf() is ChangedPath p) ShowRevisionUnifiedDiff(d.Commit.Revision, p); };
+                menu.Items.Add(miUnified);
+
+                menu.Items.Add(new Separator());
+                var miOpen = new MenuItem { Header = Loc.T("Open this revision", "打开该修订的此文件") };
+                miOpen.Click += (s, e) => { if (targetOf() is ChangedPath p) OpenRevisionFile(d.Commit.Revision, p); };
+                menu.Items.Add(miOpen);
+                lv.ContextMenu = menu;
+
+                // 底栏按钮：主要入口（不依赖右键）
+                var bar = new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    Margin = new Thickness(0, 8, 0, 0)
+                };
+                var btnChanges = new Button
+                {
+                    Content = Loc.T("Show changes", "查看变更"),
+                    Padding = new Thickness(10, 3, 10, 3),
+                    MinWidth = 96
+                };
+                btnChanges.Click += (s, e) => { if (targetOf() is ChangedPath p) ShowRevisionChanges(d.Commit.Revision, p); };
+                bar.Children.Add(btnChanges);
+
+                var btnUnified = new Button
+                {
+                    Content = Loc.T("Show changes as unified diff", "以 Unified Diff 查看"),
+                    Padding = new Thickness(10, 3, 10, 3),
+                    Margin = new Thickness(6, 0, 0, 0),
+                    MinWidth = 180
+                };
+                btnUnified.Click += (s, e) => { if (targetOf() is ChangedPath p) ShowRevisionUnifiedDiff(d.Commit.Revision, p); };
+                bar.Children.Add(btnUnified);
+
+                bar.Children.Add(new TextBlock
+                {
+                    Text = Loc.T("  Double-click a row to view changes", "  双击一行可查看该文件的变更"),
+                    FontSize = 11,
+                    Foreground = Brushes.Gray,
+                    VerticalAlignment = VerticalAlignment.Center
+                });
+                Grid.SetRow(bar, 3);
+                grid.Children.Add(bar);
+
+                win.Content = grid;
+                win.Show();
+
+                if (autoShowChanges && d.Paths.Count > 0)
+                {
+                    var p = d.Paths[0];
+                    win.Dispatcher.BeginInvoke(new Action(() => ShowRevisionChanges(d.Commit.Revision, p)));
+                }
+            }
+            catch (Exception ex)
+            {
+                BlameService.Log("detail window error: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 「查看变更」：把该修订前后两个版本在 VS 的差异比较器里并排打开
+        /// （对齐 TortoiseSVN 的 Show changes）。
+        /// </summary>
+        private void ShowRevisionChanges(int revision, ChangedPath p)
+        {
+            if (p == null) return;
+            var filePath = _filePath;
+            var repoPath = p.Path;
+            var action = p.Action;
+
+            Task.Run(async () =>
+            {
+                // 新增文件：该修订之前没有内容 → 左侧为空
+                string left = null;
+                if (!string.Equals(action, "A", StringComparison.OrdinalIgnoreCase) && revision > 1)
+                    left = await _blame.GetPathContentAsync(filePath, repoPath, revision - 1);
+                var right = await _blame.GetPathContentAsync(filePath, repoPath, revision);
+
+                await _view.VisualElement.Dispatcher.InvokeAsync(() =>
+                {
+                    try
+                    {
+                        if (left == null && right == null)
+                        {
+                            MessageBox.Show(
+                                Loc.T("Cannot fetch this revision from SVN.", "无法从 SVN 取到该修订的内容。"),
+                                "SVN Log Change Details", MessageBoxButton.OK, MessageBoxImage.Information);
+                            return;
+                        }
+                        var name = System.IO.Path.GetFileName(repoPath);
+                        var l = WriteRevisionTemp(name, revision - 1, left ?? "");
+                        var r = WriteRevisionTemp(name, revision, right ?? "");
+                        var caption = string.Format(
+                            Loc.T("{0} - r{1} changes", "{0} - r{1} 的变更"), name, revision);
+                        // 并排差异打不开（服务不可用等）就退回该修订的 unified diff 文本
+                        if (!OpenVsDiff(l, r, caption, $"r{revision - 1}", $"r{revision}"))
+                            ShowRevisionUnifiedDiff(revision, p);
+                    }
+                    catch (Exception ex)
+                    {
+                        BlameService.Log("show changes error: " + ex.Message);
+                    }
+                });
+            });
+        }
+
+        /// <summary>把某个修订的文本写到临时文件（保留原扩展名，VS 差异视图才会有语法高亮）。</summary>
+        private static string WriteRevisionTemp(string fileName, int revision, string text)
+        {
+            var dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "SvnMethodLens", "diff");
+            Directory.CreateDirectory(dir);
+            var tag = revision > 0 ? "r" + revision : "empty";
+            var file = System.IO.Path.Combine(dir, $"{tag}-{fileName}");
+            File.WriteAllText(file, text ?? "", new UTF8Encoding(false));
+            return file;
+        }
+
+        /// <summary>
+        /// 用 VS 自带的差异比较器并排打开两个文件。
+        /// 返回 false 表示服务不可用，调用方应退回 svn diff 文本视图。
+        /// </summary>
+        private bool OpenVsDiff(string leftFile, string rightFile, string caption,
+                                string leftLabel, string rightLabel)
+        {
+            // 差异服务只能在 UI 线程调用；万一不在就切回去（分析器 VSTHRD010 也要求这一点）
+            if (!Microsoft.VisualStudio.Shell.ThreadHelper.CheckAccess())
+            {
+                Application.Current?.Dispatcher.BeginInvoke(new Action(
+                    () => OpenVsDiff(leftFile, rightFile, caption, leftLabel, rightLabel)));
+                return true; // 已经排到 UI 线程，按成功处理
+            }
+            try
+            {
+                var svc = Microsoft.VisualStudio.Shell.Package.GetGlobalService(
+                    typeof(Microsoft.VisualStudio.Shell.Interop.SVsDifferenceService))
+                    as Microsoft.VisualStudio.Shell.Interop.IVsDifferenceService;
+                if (svc != null)
+                {
+                    svc.OpenComparisonWindow2(leftFile, rightFile, caption, caption,
+                        leftLabel, rightLabel, null, null, 0);
+                    return true;
+                }
+                BlameService.Log("difference service unavailable, falling back to unified diff");
+            }
+            catch (Exception ex)
+            {
+                BlameService.Log("OpenVsDiff failed: " + ex.Message);
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// 「以 Unified Diff 查看变更」：跑 svn diff -c REV，把补丁文本显示在自己的窗口里
+        /// （对齐 TortoiseSVN 的 Show changes as unified diff）。
+        /// </summary>
+        private void ShowRevisionUnifiedDiff(int revision, ChangedPath p)
+        {
+            if (p == null) return;
+            var filePath = _filePath;
+            var repoPath = p.Path;
+            var name = System.IO.Path.GetFileName(repoPath);
+            var title = string.Format(Loc.T("{0} - r{1} unified diff", "{0} - r{1} 的 unified diff"),
+                name, revision);
+
+            Task.Run(async () =>
+            {
+                var text = await _blame.GetPathDiffTextAsync(filePath, repoPath, revision);
+                await _view.VisualElement.Dispatcher.InvokeAsync(() =>
+                {
+                    if (text == null)
+                    {
+                        MessageBox.Show(
+                            Loc.T("Cannot fetch the diff of this revision.",
+                                  "无法取到该修订的 diff。"),
+                            "SVN Log Change Details", MessageBoxButton.OK, MessageBoxImage.Information);
+                        return;
+                    }
+                    if (text.Trim().Length == 0)
+                    {
+                        MessageBox.Show(
+                            Loc.T("This revision does not change this file.",
+                                  "该修订未改动此文件。"),
+                            "SVN Log Change Details", MessageBoxButton.OK, MessageBoxImage.Information);
+                        return;
+                    }
+                    ShowDiffTextWindow(title, text);
+                });
+            });
+        }
+
+        /// <summary>打开某修订下该文件的内容（只读查看，临时文件形式）。</summary>
+        private void OpenRevisionFile(int revision, ChangedPath p)
+        {
+            if (p == null) return;
+            var filePath = _filePath;
+            var repoPath = p.Path;
+            Task.Run(async () =>
+            {
+                var text = await _blame.GetPathContentAsync(filePath, repoPath, revision);
+                await _view.VisualElement.Dispatcher.InvokeAsync(() =>
+                {
+                    if (text == null)
+                    {
+                        MessageBox.Show(Loc.T("Cannot fetch this revision from SVN.", "无法从 SVN 取到该修订的内容。"),
+                            "SVN Log Change Details", MessageBoxButton.OK, MessageBoxImage.Information);
+                        return;
+                    }
+                    var f = WriteRevisionTemp(System.IO.Path.GetFileName(repoPath), revision, text);
+                    try
+                    {
+                        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                        {
+                            FileName = f,
+                            UseShellExecute = true
+                        });
+                    }
+                    catch (Exception ex) { BlameService.Log("open revision file failed: " + ex.Message); }
+                });
+            });
+        }
+
+        /// <summary>统一 diff 文本窗口：等宽字体 + 增删行着色 + 复制按钮。</summary>
+        private void ShowDiffTextWindow(string title, string text)
+        {
+            try
+            {
+                var win = new Window { Title = title, Width = 980, Height = 560 };
+                var grid = new Grid { Margin = new Thickness(8) };
+                grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+                var rtb = new RichTextBox
+                {
+                    IsReadOnly = true,
+                    FontFamily = new FontFamily("Consolas, Courier New, monospace"),
+                    FontSize = 11.5,
+                    VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                    HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+                    IsDocumentEnabled = true
+                };
+                var doc = new FlowDocument { PagePadding = new Thickness(2) };
+                var para = new Paragraph { Margin = new Thickness(0), LineHeight = 15 };
+                var add = new SolidColorBrush(Color.FromRgb(0x1B, 0x7F, 0x37));
+                var del = new SolidColorBrush(Color.FromRgb(0xC0, 0x28, 0x28));
+                var hunk = new SolidColorBrush(Color.FromRgb(0x15, 0x65, 0xC0));
+                var meta = new SolidColorBrush(Color.FromRgb(0x70, 0x70, 0x70));
+
+                foreach (var raw in text.Replace("\r\n", "\n").Split('\n'))
+                {
+                    Brush brush = null;
+                    if (raw.StartsWith("+++") || raw.StartsWith("---") || raw.StartsWith("===") ||
+                        raw.StartsWith("Index:") || raw.StartsWith("Property changes"))
+                        brush = meta;
+                    else if (raw.StartsWith("@@")) brush = hunk;
+                    else if (raw.StartsWith("+")) brush = add;
+                    else if (raw.StartsWith("-")) brush = del;
+
+                    var run = new Run(raw + "\n");
+                    if (brush != null) run.Foreground = brush;
+                    para.Inlines.Add(run);
+                }
+                doc.Blocks.Add(para);
+                rtb.Document = doc;
+                Grid.SetRow(rtb, 0);
+                grid.Children.Add(rtb);
+
+                var bar = new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    Margin = new Thickness(0, 8, 0, 0),
+                    HorizontalAlignment = HorizontalAlignment.Right
+                };
+                var copy = new Button
+                {
+                    Content = Loc.T("Copy", "复制"),
+                    Padding = new Thickness(12, 3, 12, 3),
+                    MinWidth = 72
+                };
+                copy.Click += (s, e) =>
+                {
+                    try { Clipboard.SetText(text); } catch { }
+                };
+                bar.Children.Add(copy);
+                Grid.SetRow(bar, 1);
+                grid.Children.Add(bar);
 
                 win.Content = grid;
                 win.Show();
             }
             catch (Exception ex)
             {
-                BlameService.Log("detail window error: " + ex.Message);
+                BlameService.Log("diff text window error: " + ex.Message);
             }
         }
 

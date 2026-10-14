@@ -431,6 +431,115 @@ namespace SvnMethodLens.Editor
             }).ConfigureAwait(false);
         }
 
+        /// <summary>
+        /// 把 svn log -v 里的仓库路径（如 /code/GFMSServices/Transport/TransportServices.cs）
+        /// 映射成 svn 能直接操作的目标：优先返回本地工作副本路径；不在本工作副本范围内
+        /// （同一次提交可能改了别的项目）则退回仓库 URL。
+        /// </summary>
+        public string ResolveTarget(string filePath, string repoPath)
+        {
+            if (string.IsNullOrWhiteSpace(repoPath)) return null;
+            try
+            {
+                var root = GetWcRoot(filePath);
+                var rel = ToRelative(root, filePath).Replace('\\', '/');
+                var relUrl = GetSvnItem(root, "relative-url", rel);   // ^/code/GFMSServices/Transport/TransportServices.cs
+                var wanted = repoPath.TrimStart('/');
+
+                if (!string.IsNullOrEmpty(relUrl) && relUrl.StartsWith("^/", StringComparison.Ordinal))
+                {
+                    var repoOfFile = relUrl.Substring(2);
+                    if (repoOfFile.EndsWith(rel, StringComparison.OrdinalIgnoreCase))
+                    {
+                        // wc-root 对应的仓库前缀：文件仓库路径去掉它的工作副本相对路径
+                        var prefix = repoOfFile.Substring(0, repoOfFile.Length - rel.Length);
+                        if (wanted.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                        {
+                            var local = Path.Combine(root, wanted.Substring(prefix.Length).Replace('/', '\\'));
+                            if (File.Exists(local) || Directory.Exists(local)) return local;
+                        }
+                    }
+                }
+
+                var reposRoot = GetSvnItem(root, "repos-root-url", rel);
+                if (!string.IsNullOrEmpty(reposRoot))
+                    return reposRoot.TrimEnd('/') + "/" + wanted.TrimStart('/');
+            }
+            catch (Exception ex)
+            {
+                Log("resolve target failed: " + ex.Message);
+            }
+            return null;
+        }
+
+        /// <summary>svn info --show-item 的小缓存（工作副本根 + 相对路径 → 值）。</summary>
+        private readonly ConcurrentDictionary<string, string> _svnItems = new();
+
+        private string GetSvnItem(string workingDir, string item, string relativePath)
+        {
+            var key = workingDir + "|" + item + "|" + relativePath;
+            if (_svnItems.TryGetValue(key, out var hit)) return hit;
+            string value = null;
+            try
+            {
+                value = RunSvn(workingDir,
+                    $"info --show-item {item} --non-interactive -- \"{relativePath}\"").Trim();
+            }
+            catch (Exception ex)
+            {
+                Log($"svn info --show-item {item} failed: {ex.Message}");
+            }
+            _svnItems[key] = value;
+            return value;
+        }
+
+        /// <summary>
+        /// 取某次提交里某个文件的内容。取不到（该修订里文件还不存在/已被删）返回 null，
+        /// 由调用方当作"空版本"处理——新增文件就是这种情况。
+        /// </summary>
+        public Task<string> GetPathContentAsync(string filePath, string repoPath, int revision)
+        {
+            return Task.Run(() =>
+            {
+                try
+                {
+                    var target = ResolveTarget(filePath, repoPath);
+                    if (target == null) return null;
+                    var root = GetWcRoot(filePath);
+                    var svn = new SvnClient(root, _svnExe);
+                    return svn.CatTargetAsync(target, revision, CancellationToken.None)
+                              .GetAwaiter().GetResult();
+                }
+                catch (Exception ex)
+                {
+                    Log($"cat r{revision} {repoPath} failed: {ex.Message}");
+                    return null;
+                }
+            });
+        }
+
+        /// <summary>取某次提交对某个文件的 unified diff 文本（文件不存在等情况下返回 null）。</summary>
+        public Task<string> GetPathDiffTextAsync(string filePath, string repoPath, int revision)
+        {
+            return Task.Run(() =>
+            {
+                try
+                {
+                    var target = ResolveTarget(filePath, repoPath);
+                    if (target == null) return null;
+                    var root = GetWcRoot(filePath);
+                    var svn = new SvnClient(root, _svnExe);
+                    return svn.DiffTextAsync(target, revision, CancellationToken.None)
+                              .GetAwaiter().GetResult();
+                }
+                catch (Exception ex)
+                {
+                    Log($"diff -c {revision} {repoPath} failed: {ex.Message}");
+                    return null;
+                }
+            });
+        }
+
         private static List<CommitInfo> ParseLogXml(string xml)
         {
             var list = new List<CommitInfo>();

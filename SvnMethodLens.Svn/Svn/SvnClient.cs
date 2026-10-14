@@ -134,6 +134,21 @@ public sealed class SvnClient
         => await RunAsync($"cat -r {revision} -- \"{relativePath}\"", ct);
 
     /// <summary>
+    /// 取任意目标（工作副本路径或仓库 URL）在指定修订版的内容。
+    /// 用于「查看变更」：目标既可能是当前文件，也可能是同一次提交里改动的其它文件。
+    /// </summary>
+    public async Task<string> CatTargetAsync(string target, int revision, CancellationToken ct)
+        => await RunAsync($"cat -r {revision} --non-interactive -- \"{target}\"", ct);
+
+    /// <summary>
+    /// 取某次提交对某目标的 unified diff 文本。
+    /// 显式带 --internal-diff：避免用户 svn 配置里的外部 diff 工具（如 TortoiseMerge）被拉起，
+    /// 我们要的是文本本身，好在自己窗口里渲染 / 复制。
+    /// </summary>
+    public async Task<string> DiffTextAsync(string target, int revision, CancellationToken ct)
+        => await RunAsync($"diff -c {revision} --internal-diff --non-interactive -- \"{target}\"", ct);
+
+    /// <summary>
     /// 解析 unified diff。逐行跟踪“改动后”的行号，
     /// 只记录真正增删的行——上下文行不参与方法归属判断。
     /// </summary>
