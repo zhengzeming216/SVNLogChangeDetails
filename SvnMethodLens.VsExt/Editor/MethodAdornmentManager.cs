@@ -1255,7 +1255,7 @@ namespace SvnMethodLens.Editor
             view.Click += (s, e) => ShowCommitDetail(c);
             menu.Items.Add(view);
             var showChanges = new MenuItem { Header = Loc.T("Show changes", "查看变更") };
-            showChanges.Click += (s, e) => ShowCommitDetail(c, autoShowChanges: true);
+            showChanges.Click += (s, e) => ShowChangesForCommit(c);
             menu.Items.Add(showChanges);
             row.ContextMenu = menu;
             return row;
@@ -1530,8 +1530,52 @@ namespace SvnMethodLens.Editor
             }
         }
 
+        /// <summary>
+        /// 弹框行右键「查看变更」：**直接**打开差异，不经过明细窗口。
+        /// 明细窗口在这里只是"查出这次提交改了哪些文件"的中间产物，把它弹出来会让用户
+        /// 看到明细窗口闪一下就消失（v1.10.1 及之前的行为）。
+        /// 只有确实定位不到路径时才退回明细窗口，让用户自己挑。
+        /// </summary>
+        private void ShowChangesForCommit(CommitInfo c)
+        {
+            try
+            {
+                ClosePopup();
+                var filePath = _filePath;
+                int rev = c.Revision;
+                Task.Run(async () =>
+                {
+                    var detail = await _blame.GetCommitDetailAsync(filePath, rev);
+                    var target = PickTargetPath(detail);
+                    await _view.VisualElement.Dispatcher.InvokeAsync(() =>
+                    {
+                        if (target == null) ShowDetailWindow(detail); // 没有可定位的文件：此时明细窗口才有意义
+                        else ShowRevisionChanges(rev, target);
+                    });
+                });
+            }
+            catch (Exception ex)
+            {
+                BlameService.Log("show changes (direct) error: " + ex.Message);
+            }
+        }
+
+        /// <summary>优先选"当前打开的这个文件"在本次提交里的那一行，否则取第一条。</summary>
+        private ChangedPath PickTargetPath(CommitDetail d)
+        {
+            if (d == null || d.Paths.Count == 0) return null;
+            var own = System.IO.Path.GetFileName(_filePath ?? "");
+            if (!string.IsNullOrEmpty(own))
+            {
+                var match = d.Paths.FirstOrDefault(p =>
+                    System.IO.Path.GetFileName(p.Path).Equals(own, StringComparison.OrdinalIgnoreCase));
+                if (match != null) return match;
+            }
+            return d.Paths[0];
+        }
+
         /// <summary>「View Commit Details」→ 单次提交的变更文件明细（svn log -v）。</summary>
-        private void ShowCommitDetail(CommitInfo c, bool autoShowChanges = false)
+        private void ShowCommitDetail(CommitInfo c)
         {
             try
             {
@@ -1542,8 +1586,7 @@ namespace SvnMethodLens.Editor
                 Task.Run(async () =>
                 {
                     var detail = await _blame.GetCommitDetailAsync(path, rev);
-                    await _view.VisualElement.Dispatcher.InvokeAsync(
-                        () => ShowDetailWindow(detail, autoShowChanges));
+                    await _view.VisualElement.Dispatcher.InvokeAsync(() => ShowDetailWindow(detail));
                 });
             }
             catch (Exception ex)
@@ -1552,7 +1595,7 @@ namespace SvnMethodLens.Editor
             }
         }
 
-        private void ShowDetailWindow(CommitDetail d, bool autoShowChanges = false)
+        private void ShowDetailWindow(CommitDetail d)
         {
             try
             {
@@ -1629,14 +1672,8 @@ namespace SvnMethodLens.Editor
                 }
 
                 // 当前文件在本次提交里的那一行（默认操作对象）
-                var ownPath = _filePath == null ? null : System.IO.Path.GetFileName(_filePath);
                 Func<ChangedPath> targetOf = () =>
-                {
-                    if (lv.SelectedItem is ChangedPath sel) return sel;
-                    var own = d.Paths.FirstOrDefault(
-                        p => System.IO.Path.GetFileName(p.Path).Equals(ownPath, StringComparison.OrdinalIgnoreCase));
-                    return own ?? d.Paths.FirstOrDefault();
-                };
+                    lv.SelectedItem is ChangedPath sel ? sel : PickTargetPath(d);
 
                 // 双击某一行 → 查看该文件在此提交的变更（对齐 TortoiseSVN 双击行为）
                 lv.MouseDoubleClick += (s, e) =>
@@ -1700,12 +1737,6 @@ namespace SvnMethodLens.Editor
 
                 win.Content = grid;
                 win.Show();
-
-                if (autoShowChanges && d.Paths.Count > 0)
-                {
-                    var p = d.Paths[0];
-                    win.Dispatcher.BeginInvoke(new Action(() => ShowRevisionChanges(d.Commit.Revision, p)));
-                }
             }
             catch (Exception ex)
             {
