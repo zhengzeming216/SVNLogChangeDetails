@@ -745,7 +745,21 @@ namespace SvnMethodLens.Editor
         /// <summary>Git CodeLens 风格文案（段1：作者, 多久之前）。中文用全角逗号，与 Git 中文版一致。</summary>
         private static string FormatHead(MethodBlameView m)
         {
-            if (m.HasLocal) return Loc.T("Not committed yet", "尚未提交");
+            if (m.HasLocal)
+            {
+                // 方法里混有本地未提交的行（v1.10.3）：不再把已提交信息整个盖掉。
+                //   有已提交历史 → 「本地未提交 · marvin，2 天前」：未提交状态 + 上次提交的作者/时间；
+                //   整个方法都是本地新增 → 「尚未提交」。
+                if (!string.IsNullOrEmpty(m.LastAuthor))
+                {
+                    var committed = m.LastDate.HasValue ? TimeAgo(m.LastDate.Value) : "";
+                    var who = string.IsNullOrEmpty(committed)
+                        ? m.LastAuthor
+                        : Loc.Zh ? $"{m.LastAuthor}，{committed}" : $"{m.LastAuthor}, {committed}";
+                    return Loc.T("Uncommitted", "本地未提交") + " · " + who;
+                }
+                return Loc.T("Not committed yet", "尚未提交");
+            }
             if (string.IsNullOrEmpty(m.LastAuthor)) return "";
             var when = m.LastDate.HasValue ? TimeAgo(m.LastDate.Value) : "";
             if (string.IsNullOrEmpty(when)) return m.LastAuthor;
@@ -1113,6 +1127,17 @@ namespace SvnMethodLens.Editor
                 return;
             }
 
+            // v1.10.3：同 FillActivity——下表只是已提交历史，本地未提交的改动不在其中。
+            if (m.HasLocal)
+                panel.Children.Add(new TextBlock
+                {
+                    Text = Loc.T("Uncommitted local changes are not included below",
+                                 "本地未提交的改动未计入以下历史"),
+                    FontSize = 11,
+                    Foreground = Brushes.Gray,
+                    Margin = new Thickness(0, 0, 0, 4)
+                });
+
             // 列：Revision | Description | Author | Date
             var grid = new Grid();
             grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
@@ -1295,6 +1320,18 @@ namespace SvnMethodLens.Editor
                 FontSize = 11,
                 Margin = new Thickness(0, 0, 0, 6)
             });
+
+            // v1.10.3：方法有本地未提交行时，明确告诉用户下图只是「已提交」历史，
+            // 避免出现"标注说尚未提交、点开却全是具体的人"这种困惑。
+            if (m.HasLocal)
+                panel.Children.Add(new TextBlock
+                {
+                    Text = Loc.T("Uncommitted local changes are not included below",
+                                 "本地未提交的改动未计入以下历史"),
+                    FontSize = 11,
+                    Foreground = Brushes.Gray,
+                    Margin = new Thickness(0, 0, 0, 6)
+                });
 
             var content = new Grid();
             content.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });

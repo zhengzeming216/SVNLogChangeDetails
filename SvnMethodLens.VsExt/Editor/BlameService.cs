@@ -693,12 +693,10 @@ namespace SvnMethodLens.Editor
 
                 var owned = codeLines - localLines;
                 var top = perAuthor.OrderByDescending(kv => kv.Value).FirstOrDefault();
-                if (localLines > 0)
-                {
-                    lastAuthor = "本地未提交";
-                    lastDate = DateTime.Now;
-                }
-
+                // lastAuthor/lastDate 只记录「已提交行」里的最新修订：方法混有本地未提交行时，
+                // HasLocal 负责表达未提交状态，作者/时间仍保留上次提交的信息（v1.10.3：
+                // 之前这里会把两者盖成本地未提交/Now，导致段1只剩"尚未提交"，
+                // 与段2的 "N authors, M changes" 自相矛盾）。
                 var revs = new List<int>(revisions);
                 revs.Sort();
                 revs.Reverse();
