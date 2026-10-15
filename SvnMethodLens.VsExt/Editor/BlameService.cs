@@ -113,7 +113,12 @@ namespace SvnMethodLens.Editor
 
         public async Task<List<MethodBlameView>> ComputeAsync(string filePath, string bufferText, CancellationToken ct)
         {
-            var key = Sha256(filePath + "|" + bufferText);
+            // v1.10.4：缓存键必须带上工作副本修订号。
+            // 之前只用「路径 + 文本内容」做键，而 svn commit / update / revert 都不改文件内容，
+            // 于是提交后文本哈希不变 → 直接命中提交前算出的旧 blame → 标注一直停在
+            // "Not committed yet"，明明已经提交却看不到最新记录。
+            var rev = GetFileRevision(filePath);
+            var key = Sha256(filePath + "|" + rev + "|" + bufferText);
             var cacheKey = filePath + "#" + key;
 
             if (_results.TryGetValue(cacheKey, out var hit)) return hit;
@@ -494,6 +499,50 @@ namespace SvnMethodLens.Editor
             }
             _svnItems[key] = value;
             return value;
+        }
+
+        /// <summary>
+        /// 取工作副本里某个文件当前的修订号（"svn info --show-item revision"）。
+        /// 提交 / 更新 / 还原都会让它变化，而文件内容可能一字不变——
+        /// 所以它必须进入 blame 缓存键，否则提交后仍会命中提交前算出的旧 blame
+        /// （表现为明明已提交，标注还写"Not committed yet"）。
+        /// 带 TTL 的短缓存：轮询时不至于每次都拉起一个 svn 进程。
+        /// </summary>
+        public string GetFileRevision(string filePath)
+        {
+            try
+            {
+                var root = GetWcRoot(filePath);
+                if (string.IsNullOrEmpty(root)) return "";
+                var rel = ToRelative(root, filePath);
+                if (_revCache.TryGetValue(filePath, out var cached)
+                    && (DateTime.UtcNow - cached.Item1).TotalSeconds < 5)
+                    return cached.Item2;
+
+                var rev = RunSvn(root, "info --show-item revision --non-interactive -- \"" + rel + "\"")
+                            .Trim();
+                _revCache[filePath] = (DateTime.UtcNow, rev);
+                return rev;
+            }
+            catch (Exception ex)
+            {
+                Log("revision probe failed: " + ex.Message);
+                return "";
+            }
+        }
+
+        private readonly ConcurrentDictionary<string, (DateTime, string)> _revCache = new();
+
+        /// <summary>强制让某文件的内存 blame 结果失效（提交、更新、还原后调用）。</summary>
+        public void Invalidate(string filePath)
+        {
+            // 只清这个文件的条目（键形如 "路径#内容哈希"），别波及其他打开的文件
+            if (string.IsNullOrEmpty(filePath)) return;
+            var prefix = filePath + "#";
+            foreach (var k in _results.Keys)
+                if (k.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                    _results.TryRemove(k, out _);
+            _revCache.TryRemove(filePath, out _);
         }
 
         /// <summary>
