@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using SvnMethodLens.Core.Svn;
@@ -50,6 +51,11 @@ namespace SvnMethodLens.Editor
     {
         public string Action { get; set; } = "";
         public string Path { get; set; } = "";
+        /// <summary>"file" / "dir"：svn log -v 的 path kind；目录条目没有可比较的文件内容。</summary>
+        public string Kind { get; set; } = "";
+
+        public bool IsDirectory =>
+            string.Equals(Kind, "dir", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>单次提交的明细（含变更文件列表），供「View Commit Details」。</summary>
@@ -111,8 +117,29 @@ namespace SvnMethodLens.Editor
             catch { }
         }
 
+        /// <summary>按文件类型选成员扫描器：JS 系走 JavaScriptScanner，其余走 C# 行级扫描器。
+        /// v1.11.0：JS 与 C# 共用同一套 blame/聚合/弹窗链路，只是切成员边界。</summary>
+        private static List<EditorMember> ScanMembers(string filePath, string text)
+        {
+            switch (Path.GetExtension(filePath)?.ToLowerInvariant())
+            {
+                case ".js":
+                case ".jsx":
+                case ".mjs":
+                case ".cjs":
+                    return JavaScriptScanner.Scan(text);
+                default:
+                    return EditorMethodScanner.Scan(text);
+            }
+        }
+
         public async Task<List<MethodBlameView>> ComputeAsync(string filePath, string bufferText, CancellationToken ct)
         {
+            // v1.11.0：压缩文件（*.min.js）里的函数名都是单字母，标注没有意义，
+            // 且大文件 blame 很慢——直接返回空，连 svn 都不跑。
+            if (filePath != null && filePath.EndsWith(".min.js", StringComparison.OrdinalIgnoreCase))
+                return new List<MethodBlameView>();
+
             // v1.10.4：缓存键必须带上工作副本修订号。
             // 之前只用「路径 + 文本内容」做键，而 svn commit / update / revert 都不改文件内容，
             // 于是提交后文本哈希不变 → 直接命中提交前算出的旧 blame → 标注一直停在
@@ -128,7 +155,7 @@ namespace SvnMethodLens.Editor
             if (blameLines != null)
             {
                 Log($"disk-cache hit {Path.GetFileName(filePath)} lines={blameLines.Count}");
-                var members = EditorMethodScanner.Scan(bufferText);
+                var members = ScanMembers(filePath, bufferText);
                 var view = Aggregate(members, blameLines, bufferText);
                 _results[cacheKey] = view;
                 return view;
@@ -160,7 +187,7 @@ namespace SvnMethodLens.Editor
 
                 SaveBlameCache(key, blame);
 
-                var members = EditorMethodScanner.Scan(bufferText);
+                var members = ScanMembers(filePath, bufferText);
                 var view = Aggregate(members, blame, bufferText);
                 _results[filePath + "#" + key] = view;
                 Log($"blame done {Path.GetFileName(filePath)} in {sw.Elapsed.TotalSeconds:F1}s (lines={blame.Count})");
@@ -368,7 +395,10 @@ namespace SvnMethodLens.Editor
                     .ToList();
                 var lines = content.Replace("\r\n", "\n").Split('\n');
 
-                // 定位声明行：跳过注释行，找"方法名(" 的第一次出现
+                // 定位声明行：跳过注释行，找"方法名(" 的第一次出现。
+                // v1.11.0：兼容 JS 声明风格——除 name( 外还认：
+                //   "name": / name:          （对象字面量方法，jQuery 主力写法）
+                //   name = function / name = (…) => / name = ident =>   （赋值式函数）
                 int decl = -1;
                 for (int i = 0; i < lines.Length; i++)
                 {
@@ -377,9 +407,34 @@ namespace SvnMethodLens.Editor
                     if (trim.StartsWith("//") || trim.StartsWith("*") || trim.StartsWith("/*")) continue;
                     int p = t.IndexOf(methodName, StringComparison.Ordinal);
                     if (p < 0) continue;
+                    // 标识符边界：前面不能紧跟标识符字符（避免 save 命中 saved/unsaved）
+                    if (p > 0 && (char.IsLetterOrDigit(t[p - 1]) || t[p - 1] == '_' || t[p - 1] == '$'))
+                        continue;
                     int after = p + methodName.Length;
                     while (after < t.Length && char.IsWhiteSpace(t[after])) after++;
-                    if (after < t.Length && t[after] == '(') { decl = i + 1; break; }
+                    if (after >= t.Length) continue;
+
+                    bool hit = t[after] == '(';
+                    if (!hit && (t[after] == '"' || t[after] == '\''))
+                    {
+                        int q = after + 1;
+                        while (q < t.Length && char.IsWhiteSpace(t[q])) q++;
+                        hit = q < t.Length && t[q] == ':';
+                    }
+                    if (!hit && t[after] == ':') hit = true;
+                    if (!hit && t[after] == '=')
+                    {
+                        int q = after + 1;
+                        while (q < t.Length && char.IsWhiteSpace(t[q])) q++;
+                        if (q < t.Length)
+                        {
+                            var rest = t.Substring(q);
+                            hit = rest.StartsWith("function", StringComparison.Ordinal)
+                               || rest.StartsWith("(", StringComparison.Ordinal)
+                               || Regex.IsMatch(rest, @"^[A-Za-z_$][\w$]*\s*=>");
+                        }
+                    }
+                    if (hit) { decl = i + 1; break; }
                 }
                 if (decl <= 0) return revs;
 
@@ -427,7 +482,8 @@ namespace SvnMethodLens.Editor
                             d.Paths.Add(new ChangedPath
                             {
                                 Action = (string)p.Attribute("action") ?? "",
-                                Path = p.Value
+                                Path = p.Value,
+                                Kind = (string)p.Attribute("kind") ?? ""
                             });
                     }
                 }
