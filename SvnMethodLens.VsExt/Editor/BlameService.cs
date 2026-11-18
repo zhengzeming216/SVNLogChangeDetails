@@ -87,6 +87,7 @@ namespace SvnMethodLens.Editor
         private readonly ConcurrentDictionary<string, Task<List<CommitInfo>>> _fileLogInflight = new();
         private readonly ConcurrentDictionary<string, List<CommitInfo>> _methodLogCache = new();
         private readonly ConcurrentDictionary<string, Task<List<CommitInfo>>> _methodLogInflight = new();
+        private int _unresolvedMethodRevisions;
 
         public BlameService()
         {
@@ -282,97 +283,188 @@ namespace SvnMethodLens.Editor
         }
 
         /// <summary>
-        /// 方法级完整历史：blame 只给每行"最后一次修改"的修订，早期提交会被后续修改覆盖；
-        /// 这里用 svn blame -r 更早版本 + svn cat 沿方法体逐代回溯，收集从创建至今的全部修订。
-        /// 结果按「文件 + 起始行 + 方法名」缓存。
+        /// 方法级完整历史（完整性优先）：
+        /// 1) 候选集是**该文件的完整 svn log**，每次打开强制刷新，不截断、不以 blame 集合为准；
+        /// 2) 对每个修订取 -c 的增删行，并在**该修订版本**里重新扫描同名方法的行号范围
+        ///    （方法会被搬动，拿当前行号去比历史 diff 会误判）；
+        /// 3) 只有增删行真正落在方法范围内，才算「改过这个方法」。
+        /// 这样即使某次提交后来被覆盖、或方法整体位移，也不会漏记录。
         /// </summary>
-        public async Task<List<CommitInfo>> GetMethodLogAsync(
+        public Task<List<CommitInfo>> GetMethodLogAsync(
             string filePath, string methodName, int startLine, IList<int> knownRevisions)
         {
-            var key = filePath + "|" + startLine + "|" + methodName;
-            if (_methodLogCache.TryGetValue(key, out var hit)) return hit;
-            var task = _methodLogInflight.GetOrAdd(key, _ =>
-                Task.Run(() => LoadMethodLogAsync(filePath, methodName, knownRevisions)));
-            try
-            {
-                var r = await task.ConfigureAwait(false);
-                _methodLogCache[key] = r;
-                return r;
-            }
-            finally
-            {
-                _methodLogInflight.TryRemove(key, out _);
-            }
-        }
-
-        private async Task<List<CommitInfo>> LoadMethodLogAsync(
-            string filePath, string methodName, IList<int> knownRevisions)
-        {
-            var found = new SortedSet<int>();
-            try
+            return Task.Run(async () =>
             {
                 var root = GetWcRoot(filePath);
                 var rel = ToRelative(root, filePath);
-                foreach (var r in knownRevisions ?? new List<int>())
-                    if (r > 0) found.Add(r);
 
-                if (!string.IsNullOrEmpty(methodName) && found.Count > 0)
+                // 完整 log 是唯一候选来源；强制刷新，避免新提交被旧缓存挡住。
+                var fileLog = LoadFileLogFresh(filePath, root, rel);
+                _fileLogCache["file|" + filePath] = fileLog;
+                var head = fileLog.Count == 0 ? 0 : fileLog.Max(c => c.Revision);
+
+                var key = filePath + "|" + startLine + "|" + methodName + "|" + head;
+                if (_methodLogCache.TryGetValue(key, out var hit)) return hit;
+
+                // 完整历史要跑几百次 svn diff/cat，结果落盘：第二次打开秒出。
+                // 缓存 key 带 head revision，文件有新提交时自动失效。
+                var disk = TryLoadMethodHistoryCache(key, fileLog);
+                if (disk != null)
                 {
-                    var sw = Stopwatch.StartNew();
-                    int rev = found.Min, guard = 0;
-                    while (rev > 1 && ++guard <= 40 && sw.Elapsed.TotalSeconds < 120)
-                    {
-                        // blame 给每行修订（无内容），cat 给该版本内容——两者按行号对齐
-                        string blameXml, content;
-                        try
-                        {
-                            blameXml = RunSvn(root, $"blame --xml --non-interactive -r {rev - 1} -- \"{rel}\"");
-                            content = RunSvn(root, $"cat --non-interactive -r {rev - 1} -- \"{rel}\"");
-                        }
-                        catch
-                        {
-                            break; // 版本可能已不存在（文件后来才加入等）
-                        }
-                        var rangeRevs = MethodRevisionsAtRevision(blameXml, content, methodName);
-                        if (rangeRevs.Count == 0) break; // 该版本里已找不到方法 → 到创建提交为止
-                        bool added = rangeRevs.Any(r => !found.Contains(r));
-                        foreach (var r in rangeRevs) found.Add(r);
-                        int min = rangeRevs.Min();
-                        if (!added || min >= rev) break; // 没有更早的历史了
-                        rev = min;
-                    }
-                    Log($"method history {methodName}: {found.Count} revisions, walked {guard} epochs, {sw.Elapsed.TotalSeconds:F1}s");
+                    _methodLogCache[key] = disk;
+                    return disk;
                 }
-            }
-            catch (Exception ex)
-            {
-                Log($"method log failed: {ex.Message}");
-            }
 
-            // 修订号 → 提交摘要（复用全量文件 log）
+                var task = _methodLogInflight.GetOrAdd(key, _ =>
+                    BuildMethodHistoryAsync(filePath, root, rel, methodName, knownRevisions, fileLog));
+                try
+                {
+                    var r = await task.ConfigureAwait(false);
+                    _methodLogCache[key] = r;
+                    SaveMethodHistoryCache(key, r);
+                    return r;
+                }
+                finally
+                {
+                    _methodLogInflight.TryRemove(key, out _);
+                }
+            });
+        }
+
+        private List<CommitInfo> TryLoadMethodHistoryCache(string key, List<CommitInfo> fileLog)
+        {
             try
             {
-                var fileLog = await GetFileLogAsync(filePath).ConfigureAwait(false);
+                var path = Path.Combine(_cacheDir, "method-history-" + Sha256(key) + ".txt");
+                if (!File.Exists(path)) return null;
+                var revs = File.ReadAllLines(path)
+                    .Select(l => int.TryParse(l.Trim(), out var r) ? r : 0)
+                    .Where(r => r > 0).ToList();
+                if (revs.Count == 0) return null;
                 var byRev = new Dictionary<int, CommitInfo>();
                 foreach (var c in fileLog) byRev[c.Revision] = c;
-                var list = new List<CommitInfo>();
-                foreach (var r in found)
-                {
-                    if (byRev.TryGetValue(r, out var c)) list.Add(c);
-                    else list.Add(new CommitInfo { Revision = r, Message = "(r" + r + ")" });
-                }
-                return list.OrderByDescending(c => c.Revision).ToList();
+                return revs.OrderByDescending(r => r).Select(r =>
+                    byRev.TryGetValue(r, out var c)
+                        ? c
+                        : new CommitInfo { Revision = r, Message = "(r" + r + ")" }).ToList();
             }
             catch
             {
-                return found.Select(r => new CommitInfo { Revision = r })
-                            .OrderByDescending(c => c.Revision).ToList();
+                return null;
+            }
+        }
+
+        private void SaveMethodHistoryCache(string key, List<CommitInfo> result)
+        {
+            try
+            {
+                Directory.CreateDirectory(_cacheDir);
+                var path = Path.Combine(_cacheDir, "method-history-" + Sha256(key) + ".txt");
+                File.WriteAllLines(path, result.Select(c => c.Revision.ToString()));
+            }
+            catch { }
+        }
+
+        private List<CommitInfo> LoadFileLogFresh(string filePath, string root, string rel)
+        {
+            try
+            {
+                return ParseLogXml(RunSvn(root, $"log --xml --non-interactive -- \"{rel}\""));
+            }
+            catch (Exception ex)
+            {
+                Log($"method history file log refresh failed: {ex.Message}");
+                return _fileLogCache.TryGetValue("file|" + filePath, out var old)
+                    ? old
+                    : new List<CommitInfo>();
+            }
+        }
+
+        private async Task<List<CommitInfo>> BuildMethodHistoryAsync(
+            string filePath, string root, string rel, string methodName,
+            IList<int> knownRevisions, List<CommitInfo> fileLog)
+        {
+            var sw = Stopwatch.StartNew();
+
+            // 完整候选：文件 log ∪ blame 中出现过的修订（后者防止 log 因路径改名漏项）
+            var byRev = new Dictionary<int, CommitInfo>();
+            foreach (var c in fileLog) byRev[c.Revision] = c;
+            foreach (var r in knownRevisions ?? new List<int>())
+                if (r > 0 && !byRev.ContainsKey(r))
+                    byRev[r] = new CommitInfo { Revision = r, Message = "(r" + r + ")" };
+            var candidates = byRev.Values.OrderByDescending(c => c.Revision).ToList();
+
+            var membersByRev = new ConcurrentDictionary<int, List<EditorMember>>();
+            var keep = new ConcurrentBag<CommitInfo>();
+            var gate = new SemaphoreSlim(8);
+            Interlocked.Exchange(ref _unresolvedMethodRevisions, 0);
+
+            var tasks = candidates.Select(async c =>
+            {
+                await gate.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    var touches = await Task.Run(() => RevisionTouchesMethod(
+                        filePath, root, rel, c.Revision, methodName, membersByRev))
+                        .ConfigureAwait(false);
+                    if (touches) keep.Add(c);
+                }
+                finally
+                {
+                    gate.Release();
+                }
+            });
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+
+            var unresolved = Interlocked.Exchange(ref _unresolvedMethodRevisions, 0);
+            var result = keep.OrderByDescending(c => c.Revision).ToList();
+            Log($"method history {methodName}: kept {result.Count}/{candidates.Count} " +
+                $"(full file log={fileLog.Count} entries), unresolved={unresolved}, " +
+                $"{sw.Elapsed.TotalSeconds:F1}s");
+            return result;
+        }
+
+        /// <summary>判断某修订的增删行是否落在「该修订版本里」同名方法的范围内。</summary>
+        private bool RevisionTouchesMethod(string filePath, string root, string rel,
+            int revision, string methodName, ConcurrentDictionary<int, List<EditorMember>> membersByRev)
+        {
+            try
+            {
+                var diff = RunSvn(root,
+                    $"diff -c {revision} --internal-diff --non-interactive -- \"{rel}\"");
+                var changedLines = SvnClient.ParseUnifiedDiff(diff)
+                    .SelectMany(h => h.Changes)
+                    .Select(ch => ch.Line)
+                    .ToList();
+                if (changedLines.Count == 0) return false;
+
+                var members = membersByRev.GetOrAdd(revision, _ =>
+                    ScanMembers(filePath, RunSvn(root,
+                        $"cat --non-interactive -r {revision} -- \"{rel}\"")));
+
+                var matches = members.Where(m =>
+                    string.Equals(m.Name, methodName, StringComparison.Ordinal)).ToList();
+                if (matches.Count == 0) return false;
+
+                // 同名重载/同名调用点可能不止一处：任一范围命中即算。
+                // 完整性优先，宁可多保留一条，也不让真实改过该方法的提交被漏掉。
+                return matches.Any(m => changedLines.Any(l => l >= m.StartLine && l <= m.EndLine));
+            }
+            catch (Exception ex)
+            {
+                // 无法判定（权限/二进制/路径改名）时保守保留，绝不静默丢弃。
+                Interlocked.Increment(ref _unresolvedMethodRevisions);
+                Log($"method history {methodName}: r{revision} unresolved: {ex.Message}");
+                return true;
             }
         }
 
         /// <summary>
+        /// [已弃用，保留作历史参考] 旧版逐代回溯用的辅助方法：
         /// 在 blame --xml（每行修订）与 cat 内容（按行号对齐）中定位方法声明行，
         /// 大括号配平找方法体范围，返回范围内出现过的全部修订。
+        /// 现在的完整历史改走 BuildMethodHistoryAsync（完整 log + 逐修订 diff 判定），
+        /// 这个方法不再被调用，因为跳跃式采样会漏掉被覆盖的中间提交。
         /// </summary>
         private static List<int> MethodRevisionsAtRevision(string blameXml, string content, string methodName)
         {

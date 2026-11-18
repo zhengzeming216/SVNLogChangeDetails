@@ -1021,20 +1021,32 @@ namespace SvnMethodLens.Editor
                         if (!_popup.IsOpen) return;
                         if (activity) FillActivity(panel, m, commits);
                         else FillCommits(panel, m, commits);
+                        // 首屏只是快速预览；明确告知还有完整 log 核对在进行，
+                        // 避免把中间结果误当成最终记录。
+                        panel.Children.Add(new TextBlock
+                        {
+                            Text = Loc.T("Verifying against the complete file log...",
+                                         "正在按完整提交日志核对方法历史…"),
+                            FontSize = 11,
+                            Foreground = Brushes.Gray,
+                            Margin = new Thickness(0, 6, 0, 0)
+                        });
                     });
 
-                    // 深度历史：blame 只有每行最后一次修改，早期提交被覆盖；
-                    // 用 svn blame -r 逐代回溯拿全量（从方法创建至今），完成后刷新弹框
+                    // 完整历史：以文件全量 svn log 为候选，逐修订用 diff 判定是否改过该方法。
+                    // 结果无条件替换首屏，保证记录完整性（首屏只是 blame 集合的快速预览）。
                     try
                     {
                         var full = await _blame.GetMethodLogAsync(path, m.Name, m.StartLine, revisions);
-                        if (full.Count > commits.Count)
-                            await _view.VisualElement.Dispatcher.InvokeAsync(() =>
-                            {
-                                if (!_popup.IsOpen) return;
-                                if (activity) FillActivity(panel, m, full);
-                                else FillCommits(panel, m, full);
-                            });
+                        // 完整结果以「文件全量 log + 逐修订 diff 判定」为准，无条件替换首屏：
+                        // 首屏只是 blame 集合的快速预览，条数可能更多也可能更少，不能按数量比较。
+                        BlameService.Log($"popup history {m.Name}: first={commits.Count}, complete={full.Count}");
+                        await _view.VisualElement.Dispatcher.InvokeAsync(() =>
+                        {
+                            if (!_popup.IsOpen) return;
+                            if (activity) FillActivity(panel, m, full);
+                            else FillCommits(panel, m, full);
+                        });
                     }
                     catch (Exception ex)
                     {
